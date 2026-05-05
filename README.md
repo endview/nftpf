@@ -67,4 +67,4 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 ## License
 
-See the repository `LICENSE` file.
+This project is released under the MIT License. See the repository `LICENSE` file.
