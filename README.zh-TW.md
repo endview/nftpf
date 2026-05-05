@@ -71,4 +71,4 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 ## 授權
 
-倉庫目前包含 `LICENSE` 檔案，請以倉庫中的授權檔案為準。
+本專案使用 MIT License 發布，詳情請查看倉庫中的 `LICENSE` 檔案。
