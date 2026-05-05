@@ -1,5 +1,7 @@
 # NFT Port Forwarding Tool
 
+[English](README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
+
 `nftpf` is an interactive Linux port-forwarding tool built on top of nftables. It is designed to make IPv4, IPv6, and DDNS-based forwarding rules easier to manage from a simple terminal menu.
 
 ## Features
@@ -65,4 +67,4 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 ## License
 
-No license has been specified yet.
+See the repository `LICENSE` file.
