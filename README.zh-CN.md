@@ -71,4 +71,4 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 ## 许可证
 
-仓库当前包含 `LICENSE` 文件，请以仓库中的许可证文件为准。
+本项目使用 MIT License 发布，详情请查看仓库中的 `LICENSE` 文件。
