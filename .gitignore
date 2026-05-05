@@ -1,0 +1,17 @@
+_tmp_qh_wsl_xtrace.sh
+setup-switch-v6-from-dynamicv6.full-updates-*.sh
+*.log
+*.tmp
+*.bak
+*.out
+
+# Local work artifacts
+_apk_scan/
+docx_work/
+output/
+tmp/
+
+# Unrelated local scripts kept outside this repository's release scope
+cdt-auto-restart.py
+nft_helper.sh
+setup-switch-v6-from-dynamicv6.sh
