@@ -8,12 +8,17 @@ PLAIN='\033[0m'
 CONFIG_FILE="${CONFIG_FILE:-/etc/nftables.conf}"
 STATE_DIR="${STATE_DIR:-/etc/nft-port-forward}"
 RULES_FILE="${RULES_FILE:-$STATE_DIR/rules.db}"
+ACCESS_FILE="${ACCESS_FILE:-$STATE_DIR/access.conf}"
+BACKUP_DIR="${BACKUP_DIR:-$STATE_DIR/backups}"
+ACCESS_HISTORY_FILE="${ACCESS_HISTORY_FILE:-$STATE_DIR/access-history.log}"
 SHORTCUT_PATH="${SHORTCUT_PATH:-/usr/local/bin/nftpf}"
 CRON_FILE="${CRON_FILE:-/etc/cron.d/nft-port-forward-ddns}"
 SERVICE_NAME="nftables"
 REAL_NFT_CMD="${REAL_NFT_CMD:-}"
 APPLY_RESULT=""
 CONFIG_AUTO_REBUILT=0
+CONFIG_RENDER_VERSION="2"
+TRACK_TIMEOUT="${TRACK_TIMEOUT:-30m}"
 IPV6_ROUTE_MARK="${IPV6_ROUTE_MARK:-100}"
 IPV6_ROUTE_TABLE="${IPV6_ROUTE_TABLE:-100}"
 NFTPF_IPV6_ROUTEFIX="${NFTPF_IPV6_ROUTEFIX:-auto}"
@@ -24,6 +29,10 @@ if [[ "${NFT_HELPER_SKIP_ROOT:-0}" != "1" && $EUID -ne 0 ]]; then
 fi
 
 SYS_TYPE="Linux (systemd)"
+
+# -----------------------------------------------------------------------------
+# Runtime helpers
+# -----------------------------------------------------------------------------
 
 find_nft_cmd() {
     local candidate
@@ -73,9 +82,22 @@ pause_and_return() {
     main_menu
 }
 
+pause_and_access_control() {
+    echo ""
+    echo -e "${YELLOW}按下任意键返回访问控制...${PLAIN}"
+    read -n 1 -s -r
+    access_control_menu
+}
+
 ensure_state_dir() {
     mkdir -p "$STATE_DIR"
+    mkdir -p "$BACKUP_DIR"
     touch "$RULES_FILE"
+    touch "$ACCESS_HISTORY_FILE"
+    chmod 600 "$ACCESS_HISTORY_FILE" 2>/dev/null || true
+    if [ ! -f "$ACCESS_FILE" ]; then
+        echo "mode=off" > "$ACCESS_FILE"
+    fi
 }
 
 backup_file() {
@@ -87,6 +109,53 @@ backup_file() {
         cp "$file" "$backup"
         echo -e "${YELLOW}已备份: $backup${PLAIN}"
     fi
+}
+
+create_state_backup() {
+    local reason=${1:-manual}
+    local quiet=${2:-0}
+    local timestamp
+    local safe_reason
+    local tmp_dir
+    local backup_path
+
+    command -v tar >/dev/null 2>&1 || {
+        [ "$quiet" = "1" ] || echo -e "${YELLOW}警告：未找到 tar，已跳过备份。${PLAIN}"
+        return 0
+    }
+
+    ensure_state_dir
+    timestamp=$(date +%Y%m%d%H%M%S)
+    safe_reason=$(printf '%s' "$reason" | tr -c 'A-Za-z0-9_-' '_')
+    tmp_dir=$(mktemp -d) || return 1
+    backup_path="$BACKUP_DIR/nftpf-backup-${timestamp}-${safe_reason}.tar.gz"
+
+    [ -f "$RULES_FILE" ] && cp "$RULES_FILE" "$tmp_dir/rules.db"
+    [ -f "$ACCESS_FILE" ] && cp "$ACCESS_FILE" "$tmp_dir/access.conf"
+    [ -f "$ACCESS_HISTORY_FILE" ] && cp "$ACCESS_HISTORY_FILE" "$tmp_dir/access-history.log"
+    [ -f "$CONFIG_FILE" ] && cp "$CONFIG_FILE" "$tmp_dir/nftables.conf"
+    {
+        echo "created_at=$timestamp"
+        echo "reason=$reason"
+        echo "config_file=$CONFIG_FILE"
+        echo "rules_file=$RULES_FILE"
+        echo "access_file=$ACCESS_FILE"
+        echo "access_history_file=$ACCESS_HISTORY_FILE"
+    } > "$tmp_dir/meta.txt"
+
+    tar -C "$tmp_dir" -czf "$backup_path" . || {
+        rm -rf "$tmp_dir"
+        return 1
+    }
+    cp "$backup_path" "$BACKUP_DIR/latest.tar.gz"
+    case "$reason" in
+        manual) cp "$backup_path" "$BACKUP_DIR/latest-manual.tar.gz" ;;
+        *) cp "$backup_path" "$BACKUP_DIR/latest-auto.tar.gz" ;;
+    esac
+    rm -rf "$tmp_dir"
+
+    LAST_BACKUP_PATH="$backup_path"
+    [ "$quiet" = "1" ] || echo -e "${GREEN}备份已创建: $backup_path${PLAIN}"
 }
 
 ensure_sysctl_setting() {
@@ -122,6 +191,10 @@ enable_ip_forward() {
         sysctl -p >/dev/null 2>&1
     fi
 }
+
+# -----------------------------------------------------------------------------
+# System setup and route handling
+# -----------------------------------------------------------------------------
 
 persist_ipv6_dnat_policy_route_ifupdown() {
     local config_file="/etc/network/interfaces.d/50-cloud-init"
@@ -249,6 +322,10 @@ check_shortcut() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# Input validation and normalization
+# -----------------------------------------------------------------------------
+
 is_valid_ipv4() {
     local ip=$1
     local old_ifs
@@ -272,6 +349,39 @@ is_valid_ipv6() {
     [[ "$ip" == *:* ]] || return 1
     [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
     [[ "$ip" != *:::* ]] || return 1
+}
+
+validate_access_entry() {
+    local entry=$1
+    local base
+    local prefix=""
+    local family
+
+    [[ -n "$entry" && "$entry" != *"|"* ]] || return 1
+
+    if [[ "$entry" == */* ]]; then
+        base=${entry%%/*}
+        prefix=${entry##*/}
+        [[ -n "$base" && "$prefix" =~ ^[0-9]+$ ]] || return 1
+    else
+        base="$entry"
+    fi
+
+    family=$(classify_host "$base")
+    case "$family" in
+        ipv4)
+            [[ -z "$prefix" || ( "$prefix" -ge 0 && "$prefix" -le 32 ) ]] || return 1
+            ;;
+        ipv6)
+            [[ -z "$prefix" || ( "$prefix" -ge 0 && "$prefix" -le 128 ) ]] || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    ACCESS_ENTRY_FAMILY="$family"
+    ACCESS_ENTRY_VALUE="$entry"
 }
 
 is_valid_hostname() {
@@ -391,6 +501,10 @@ format_listen_display() {
     echo "$shown:$ports"
 }
 
+# -----------------------------------------------------------------------------
+# Rule database helpers
+# -----------------------------------------------------------------------------
+
 join_rule() {
     local IFS='|'
     echo "$*"
@@ -465,6 +579,53 @@ rule_conflicts_in_file() {
     done < "$file"
 
     return 1
+}
+
+get_access_mode() {
+    local mode
+
+    mode=$(grep -m1 '^mode=' "$ACCESS_FILE" 2>/dev/null | cut -d= -f2)
+    case "$mode" in
+        whitelist|blacklist|off) echo "$mode" ;;
+        *) echo "off" ;;
+    esac
+}
+
+access_mode_label() {
+    case "$(get_access_mode)" in
+        whitelist) echo "白名单" ;;
+        blacklist) echo "黑名单" ;;
+        *) echo "关闭" ;;
+    esac
+}
+
+access_entry_count() {
+    if [ -f "$ACCESS_FILE" ]; then
+        grep -c '^entry=' "$ACCESS_FILE" 2>/dev/null || true
+    else
+        echo 0
+    fi
+}
+
+access_entries_for_family() {
+    local family=$1
+
+    grep "^entry=$family|" "$ACCESS_FILE" 2>/dev/null | cut -d'|' -f2-
+}
+
+format_access_entries_for_family() {
+    local family=$1
+    local entry
+    local output=""
+    local sep=""
+
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        output="${output}${sep}${entry}"
+        sep=", "
+    done < <(access_entries_for_family "$family")
+
+    echo "$output"
 }
 
 resolve_domain() {
@@ -792,6 +953,10 @@ import_existing_rules_from_config() {
     fi
 }
 
+# -----------------------------------------------------------------------------
+# nftables rendering
+# -----------------------------------------------------------------------------
+
 render_rules_for_family() {
     local rules_file=$1
     local family=$2
@@ -805,17 +970,244 @@ render_rules_for_family() {
     done < "$rules_file"
 }
 
+rules_file_has_family_in_file() {
+    local rules_file=$1
+    local family=$2
+    local line
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read_rule_fields "$line"
+        [[ "$R_FAMILY" == "$family" ]] && return 0
+    done < "$rules_file"
+
+    return 1
+}
+
+rules_file_has_family() {
+    rules_file_has_family_in_file "$RULES_FILE" "$1"
+}
+
+build_forward_match_from_current() {
+    local listen_match=""
+    local port_expr
+
+    if [[ -n "$R_LISTEN_IP" ]]; then
+        if [ "$R_FAMILY" = "ipv6" ]; then
+            listen_match="ip6 daddr $R_LISTEN_IP "
+        else
+            listen_match="ip daddr $R_LISTEN_IP "
+        fi
+    fi
+
+    if [ "$R_LISTEN_START" = "$R_LISTEN_END" ]; then
+        port_expr="$R_LISTEN_START"
+    else
+        port_expr="{ $R_LISTEN_START-$R_LISTEN_END }"
+    fi
+
+    echo "${listen_match}meta l4proto {tcp, udp} th dport $port_expr"
+}
+
+collect_port_elements_for_family() {
+    local rules_file=$1
+    local family=$2
+    local line
+    local elem
+    local output=""
+    local sep=""
+    local seen="|"
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read_rule_fields "$line"
+        [[ "$R_FAMILY" == "$family" ]] || continue
+
+        if [ "$R_LISTEN_START" = "$R_LISTEN_END" ]; then
+            elem="$R_LISTEN_START"
+        else
+            elem="$R_LISTEN_START-$R_LISTEN_END"
+        fi
+
+        [[ "$seen" == *"|$elem|"* ]] && continue
+        seen="${seen}${elem}|"
+        output="${output}${sep}${elem}"
+        sep=", "
+    done < "$rules_file"
+
+    echo "$output"
+}
+
+render_tracking_table_for_family() {
+    local rules_file=$1
+    local family=$2
+    local table_family
+    local addr_keyword
+    local addr_type
+
+    rules_file_has_family_in_file "$rules_file" "$family" || return 0
+
+    if [ "$family" = "ipv6" ]; then
+        table_family="ip6"
+        addr_keyword="ip6"
+        addr_type="ipv6_addr"
+    else
+        table_family="ip"
+        addr_keyword="ip"
+        addr_type="ipv4_addr"
+    fi
+
+    cat <<EOF
+table $table_family nftpf_track {
+    set observed {
+        type $addr_type
+        flags dynamic,timeout
+        timeout $TRACK_TIMEOUT
+        counter
+    }
+
+    chain prerouting {
+        type filter hook prerouting priority -102; policy accept;
+        # NFTPF_TRACK_TIMEOUT=$TRACK_TIMEOUT
+EOF
+    render_tracking_rules_for_family "$rules_file" "$family" "$addr_keyword"
+    cat <<EOF
+    }
+}
+
+EOF
+}
+
+render_tracking_rules_for_family() {
+    local rules_file=$1
+    local family=$2
+    local addr_keyword=$3
+    local line
+    local match
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read_rule_fields "$line"
+        [[ "$R_FAMILY" == "$family" ]] || continue
+        match=$(build_forward_match_from_current)
+        echo "        ct state new $match update @observed { $addr_keyword saddr timeout $TRACK_TIMEOUT }"
+    done < "$rules_file"
+}
+
+render_tracking_tables() {
+    local rules_file=$1
+
+    render_tracking_table_for_family "$rules_file" "ipv4"
+    render_tracking_table_for_family "$rules_file" "ipv6"
+}
+
+render_access_table_for_family() {
+    local rules_file=$1
+    local family=$2
+    local mode
+    local entries
+    local table_family
+    local addr_keyword
+    local addr_type
+
+    mode=$(get_access_mode)
+    [[ "$mode" != "off" ]] || return 0
+
+    rules_file_has_family_in_file "$rules_file" "$family" || return 0
+
+    entries=$(format_access_entries_for_family "$family")
+    if [ "$mode" = "blacklist" ] && [ -z "$entries" ]; then
+        return 0
+    fi
+
+    if [ "$family" = "ipv6" ]; then
+        table_family="ip6"
+        addr_keyword="ip6"
+        addr_type="ipv6_addr"
+    else
+        table_family="ip"
+        addr_keyword="ip"
+        addr_type="ipv4_addr"
+    fi
+
+    cat <<EOF
+table $table_family nftpf_access {
+EOF
+    if [ -n "$entries" ]; then
+        cat <<EOF
+    set sources {
+        type $addr_type
+        flags interval
+        elements = { $entries }
+    }
+
+EOF
+    fi
+
+    cat <<EOF
+    chain prerouting {
+        type filter hook prerouting priority -101; policy accept;
+        # NFTPF_ACCESS_MODE=$mode
+EOF
+
+    render_access_rules_for_family "$rules_file" "$family" "$mode" "$addr_keyword" "$entries"
+    cat <<EOF
+    }
+}
+
+EOF
+}
+
+render_access_rules_for_family() {
+    local rules_file=$1
+    local family=$2
+    local mode=$3
+    local addr_keyword=$4
+    local entries=$5
+    local line
+    local match
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read_rule_fields "$line"
+        [[ "$R_FAMILY" == "$family" ]] || continue
+        match=$(build_forward_match_from_current)
+
+        if [ "$mode" = "whitelist" ]; then
+            if [ -n "$entries" ]; then
+                echo "        $match $addr_keyword saddr != @sources drop"
+            else
+                echo "        $match drop"
+            fi
+        else
+            echo "        $match $addr_keyword saddr @sources drop"
+        fi
+    done < "$rules_file"
+}
+
+render_access_tables() {
+    local rules_file=$1
+
+    render_access_table_for_family "$rules_file" "ipv4"
+    render_access_table_for_family "$rules_file" "ipv6"
+}
+
 generate_config_from_rules() {
     local rules_file=$1
     local mark_hex
 
     mark_hex=$(printf '0x%08x' "$IPV6_ROUTE_MARK")
 
-    cat <<EOF
+cat <<EOF
 #!/usr/sbin/nft -f
+# NFTPF_RENDER_VERSION=$CONFIG_RENDER_VERSION
 
 flush ruleset
 
+EOF
+    render_tracking_tables "$rules_file"
+    render_access_tables "$rules_file"
+    cat <<EOF
 table ip nat {
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
@@ -884,6 +1276,7 @@ write_config_from_rules() {
 init_config() {
     local routefix_enabled=0
     local needs_rebuild=0
+    local access_mode
 
     ensure_state_dir
     import_existing_rules_from_config
@@ -895,13 +1288,18 @@ init_config() {
     fi
 
     ipv6_routefix_should_enable && routefix_enabled=1
+    access_mode=$(get_access_mode)
 
+    ! grep -q "NFTPF_RENDER_VERSION=$CONFIG_RENDER_VERSION" "$CONFIG_FILE" && needs_rebuild=1
     ! grep -q "IPV4_MARKER_START" "$CONFIG_FILE" && needs_rebuild=1
     ! grep -q "IPV6_MARKER_START" "$CONFIG_FILE" && needs_rebuild=1
     ! grep -q "ct status dnat masquerade" "$CONFIG_FILE" && needs_rebuild=1
+    rules_file_has_records && ! grep -q "NFTPF_TRACK_TIMEOUT=$TRACK_TIMEOUT" "$CONFIG_FILE" && needs_rebuild=1
     [ "$routefix_enabled" -eq 1 ] && ! grep -q "table ip6 nftpf_routefix" "$CONFIG_FILE" && needs_rebuild=1
     [ "$routefix_enabled" -eq 1 ] && ! grep -q "ct direction reply ct status dnat meta mark set" "$CONFIG_FILE" && needs_rebuild=1
     [ "$routefix_enabled" -eq 0 ] && grep -q "table ip6 nftpf_routefix" "$CONFIG_FILE" && needs_rebuild=1
+    [ "$access_mode" != "off" ] && ! grep -q "NFTPF_ACCESS_MODE=$access_mode" "$CONFIG_FILE" && needs_rebuild=1
+    [ "$access_mode" = "off" ] && grep -q "NFTPF_ACCESS_MODE=" "$CONFIG_FILE" && needs_rebuild=1
 
     if [ "$needs_rebuild" -eq 1 ]; then
         echo -e "${YELLOW}检测到 nftables 配置需要重建或升级，正在备份并重建托管配置。${PLAIN}"
@@ -927,6 +1325,7 @@ apply_config_changes() {
         return 1
     fi
 
+    snapshot_observed_sources "before-reload"
     ensure_ipv6_dnat_policy_route
 
     if [[ "${NFT_HELPER_TEST_MODE:-0}" == "1" ]]; then
@@ -962,6 +1361,8 @@ show_apply_result() {
 
 commit_rules_file() {
     local tmp_rules=$1
+
+    create_state_backup "before-rules-change" 1
 
     if ! write_config_from_rules "$tmp_rules"; then
         rm -f "$tmp_rules"
@@ -1042,6 +1443,10 @@ delete_rule_record() {
 
     commit_rules_file "$tmp_rules"
 }
+
+# -----------------------------------------------------------------------------
+# Rule workflows
+# -----------------------------------------------------------------------------
 
 collect_target_family() {
     local target_host=$1
@@ -1470,6 +1875,10 @@ disable_ddns_auto_refresh() {
     pause_and_return
 }
 
+# -----------------------------------------------------------------------------
+# Service and config management workflows
+# -----------------------------------------------------------------------------
+
 manage_service() {
     local action=$1
 
@@ -1503,17 +1912,629 @@ clear_config() {
         return
     fi
 
-    backup_file "$RULES_FILE"
-    : > "$RULES_FILE"
+    local tmp_rules
+    tmp_rules=$(mktemp) || { pause_and_return; return; }
+    : > "$tmp_rules"
 
-    if write_config_from_rules "$RULES_FILE" && apply_config_changes; then
-        show_apply_result
+    if commit_rules_file "$tmp_rules"; then
         echo -e "${GREEN}规则已清空。${PLAIN}"
     fi
     pause_and_return
 }
 
+# -----------------------------------------------------------------------------
+# Access control and observation workflows
+# -----------------------------------------------------------------------------
+
+current_access_entries_plain() {
+    grep '^entry=' "$ACCESS_FILE" 2>/dev/null | cut -d'|' -f2- | tr '\n' ' '
+}
+
+observed_entries_raw_for_family() {
+    local family=$1
+    local table_family
+    local output
+    local elements
+    local old_ifs
+    local entry
+    local ip
+    local packets
+    local bytes
+    local expires
+
+    if [ "$family" = "ipv6" ]; then
+        table_family="ip6"
+    else
+        table_family="ip"
+    fi
+
+    output=$(nft_run list set "$table_family" nftpf_track observed 2>/dev/null) || return 0
+    elements=$(printf '%s\n' "$output" | awk '
+        /elements = \{/ {
+            capture=1
+            sub(/^.*elements = \{[[:space:]]*/, "")
+        }
+        capture {
+            print
+        }
+        capture && /\}/ {
+            exit
+        }
+    ' | tr '\n' ' ')
+    elements=${elements#*elements = \{}
+    elements=${elements%\}*}
+    [[ -n "$elements" ]] || return 0
+
+    old_ifs=$IFS
+    IFS=','
+    for entry in $elements; do
+        IFS=$old_ifs
+        entry=$(echo "$entry" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [[ -n "$entry" ]] || continue
+        ip=$(echo "$entry" | awk '{print $1}')
+        [[ -n "$ip" && "$ip" != "elements" ]] || continue
+        packets=$(echo "$entry" | grep -oE 'packets [0-9]+' | awk '{print $2}')
+        bytes=$(echo "$entry" | grep -oE 'bytes [0-9]+' | awk '{print $2}')
+        expires=$(echo "$entry" | grep -oE 'expires [^ ]+' | awk '{print $2}')
+        packets=${packets:-0}
+        bytes=${bytes:-0}
+        expires=${expires:-"-"}
+        echo "$packets|$bytes|$family|$ip|$expires"
+        IFS=','
+    done
+    IFS=$old_ifs
+}
+
+load_observed_sources() {
+    local tmp_observed
+    local packets
+    local bytes
+    local family
+    local ip
+    local expires
+
+    OBSERVED_COUNT=0
+    OBSERVED_IPS=()
+    OBSERVED_FAMILIES=()
+    OBSERVED_PACKETS=()
+    OBSERVED_BYTES=()
+    OBSERVED_EXPIRES=()
+
+    tmp_observed=$(mktemp) || return 1
+    observed_entries_raw_for_family "ipv4" >> "$tmp_observed"
+    observed_entries_raw_for_family "ipv6" >> "$tmp_observed"
+
+    while IFS='|' read -r packets bytes family ip expires; do
+        [[ -n "$ip" ]] || continue
+        OBSERVED_COUNT=$((OBSERVED_COUNT + 1))
+        OBSERVED_IPS[$OBSERVED_COUNT]="$ip"
+        OBSERVED_FAMILIES[$OBSERVED_COUNT]="$family"
+        OBSERVED_PACKETS[$OBSERVED_COUNT]="$packets"
+        OBSERVED_BYTES[$OBSERVED_COUNT]="$bytes"
+        OBSERVED_EXPIRES[$OBSERVED_COUNT]="$expires"
+    done < <(sort -t'|' -k1,1nr "$tmp_observed")
+
+    rm -f "$tmp_observed"
+}
+
+show_observed_sources() {
+    local i
+
+    load_observed_sources || return 1
+    if [ "$OBSERVED_COUNT" -eq 0 ]; then
+        echo -e "${YELLOW}暂无访问记录。访问记录会在有流量命中转发端口后出现。${PLAIN}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}=== 近期访问记录（运行期，约 $TRACK_TIMEOUT 窗口） ===${PLAIN}"
+    echo "序号 | 协议族 | 源 IP | 命中次数 | bytes | 剩余时间"
+    echo "--------------------------------"
+    for ((i = 1; i <= OBSERVED_COUNT; i++)); do
+        echo "$i. ${OBSERVED_FAMILIES[$i]} ${OBSERVED_IPS[$i]} hits=${OBSERVED_PACKETS[$i]} bytes=${OBSERVED_BYTES[$i]} expires=${OBSERVED_EXPIRES[$i]}"
+    done
+    echo "--------------------------------"
+}
+
+snapshot_observed_sources() {
+    local reason=${1:-snapshot}
+    local timestamp
+    local tmp_history
+    local packets
+    local bytes
+    local family
+    local ip
+    local expires
+    local wrote=0
+
+    ensure_state_dir
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    tmp_history=$(mktemp) || return 0
+
+    {
+        observed_entries_raw_for_family "ipv4"
+        observed_entries_raw_for_family "ipv6"
+    } | while IFS='|' read -r packets bytes family ip expires; do
+        [[ -n "$ip" ]] || continue
+        echo "$timestamp $reason $family $ip packets=${packets:-0} bytes=${bytes:-0} expires=${expires:-"-"}" >> "$tmp_history"
+        wrote=1
+    done
+
+    if [ -s "$tmp_history" ]; then
+        cat "$tmp_history" >> "$ACCESS_HISTORY_FILE"
+        tail -n 1000 "$ACCESS_HISTORY_FILE" > "${tmp_history}.tail" && mv "${tmp_history}.tail" "$ACCESS_HISTORY_FILE"
+        chmod 600 "$ACCESS_HISTORY_FILE" 2>/dev/null || true
+    fi
+
+    rm -f "$tmp_history" "${tmp_history}.tail"
+}
+
+show_access_history() {
+    ensure_state_dir
+    echo -e "${YELLOW}=== 历史访问记录（显示最近 100 行） ===${PLAIN}"
+    echo "说明：历史记录是规则重载前保存的快照，不代表当前实时状态；文件只保留最近 1000 行。"
+    echo "--------------------------------"
+    if [ ! -s "$ACCESS_HISTORY_FILE" ]; then
+        echo -e "${YELLOW}暂无历史访问记录。${PLAIN}"
+    else
+        tail -n 100 "$ACCESS_HISTORY_FILE"
+    fi
+    echo "--------------------------------"
+    pause_and_access_control
+}
+
+clear_access_history() {
+    local confirm
+
+    ensure_state_dir
+    read -p "确认清空历史访问记录？[y/n]: " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}已取消。${PLAIN}"
+        pause_and_access_control
+        return
+    fi
+
+    : > "$ACCESS_HISTORY_FILE"
+    chmod 600 "$ACCESS_HISTORY_FILE" 2>/dev/null || true
+    echo -e "${GREEN}历史访问记录已清空。${PLAIN}"
+    pause_and_access_control
+}
+
+add_entries_to_blacklist() {
+    local entries=$1
+    local mode
+    local existing=""
+    local confirm
+
+    mode=$(get_access_mode)
+    if [ "$mode" = "whitelist" ]; then
+        echo -e "${YELLOW}当前是白名单模式。加入黑名单会切换到黑名单模式，并关闭白名单限制。${PLAIN}"
+        read -p "确认切换并加入黑名单？[y/n]: " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            echo -e "${YELLOW}已取消。${PLAIN}"
+            return 1
+        fi
+    elif [ "$mode" = "blacklist" ]; then
+        existing=$(current_access_entries_plain)
+    fi
+
+    prepare_access_file "blacklist" "$existing $entries" && commit_access_file "$PREPARED_ACCESS_FILE"
+}
+
+ban_observed_sources_menu() {
+    local choices
+    local choice
+    local entries=""
+
+    if ! show_observed_sources; then
+        pause_and_access_control
+        return
+    fi
+
+    read -p "请输入要加入黑名单的序号（多个用空格或英文逗号分隔，0 取消）: " choices
+    [[ "$choices" == "0" || -z "$choices" ]] && { access_control_menu; return; }
+    choices=${choices//,/ }
+
+    for choice in $choices; do
+        if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$OBSERVED_COUNT" ]; then
+            echo -e "${RED}错误：序号 $choice 无效。${PLAIN}"
+            pause_and_access_control
+            return
+        fi
+        entries="$entries ${OBSERVED_IPS[$choice]}"
+    done
+
+    if add_entries_to_blacklist "$entries"; then
+        echo -e "${GREEN}已加入黑名单并应用。${PLAIN}"
+    fi
+    pause_and_access_control
+}
+
+clear_observed_sources() {
+    nft_run flush set ip nftpf_track observed >/dev/null 2>&1 || true
+    nft_run flush set ip6 nftpf_track observed >/dev/null 2>&1 || true
+    echo -e "${GREEN}近期访问记录已清空。${PLAIN}"
+    pause_and_access_control
+}
+
+show_access_control() {
+    local mode
+    local count
+    local ipv4_entries
+    local ipv6_entries
+
+    mode=$(access_mode_label)
+    count=$(access_entry_count)
+    ipv4_entries=$(format_access_entries_for_family "ipv4")
+    ipv6_entries=$(format_access_entries_for_family "ipv6")
+
+    echo -e "当前模式: ${GREEN}$mode${PLAIN}"
+    echo -e "名单数量: ${GREEN}$count${PLAIN}"
+    if [ -n "$ipv4_entries" ]; then
+        echo "IPv4: $ipv4_entries"
+    fi
+    if [ -n "$ipv6_entries" ]; then
+        echo "IPv6: $ipv6_entries"
+    fi
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}当前没有配置名单。${PLAIN}"
+    fi
+}
+
+prepare_access_file() {
+    local mode=$1
+    local raw_entries=$2
+    local tmp_access
+    local entry
+    local entry_count=0
+
+    case "$mode" in
+        off|whitelist|blacklist) ;;
+        *)
+            echo -e "${RED}错误：访问控制模式无效。${PLAIN}"
+            return 1
+            ;;
+    esac
+
+    tmp_access=$(mktemp) || return 1
+    echo "mode=$mode" > "$tmp_access"
+
+    raw_entries=${raw_entries//,/ }
+    for entry in $raw_entries; do
+        [[ -n "$entry" ]] || continue
+        if ! validate_access_entry "$entry"; then
+            echo -e "${RED}错误：$entry 不是有效的源 IP/CIDR。名单不支持域名。${PLAIN}"
+            rm -f "$tmp_access"
+            return 1
+        fi
+
+        if ! grep -qxF "entry=$ACCESS_ENTRY_FAMILY|$ACCESS_ENTRY_VALUE" "$tmp_access"; then
+            echo "entry=$ACCESS_ENTRY_FAMILY|$ACCESS_ENTRY_VALUE" >> "$tmp_access"
+            entry_count=$((entry_count + 1))
+        fi
+    done
+
+    if [ "$mode" != "off" ] && [ "$entry_count" -eq 0 ]; then
+        echo -e "${RED}错误：启用白名单或黑名单时至少需要填写一个源 IP/CIDR。${PLAIN}"
+        rm -f "$tmp_access"
+        return 1
+    fi
+
+    PREPARED_ACCESS_FILE="$tmp_access"
+}
+
+access_file_has_family() {
+    local access_file=$1
+    local family=$2
+
+    grep -q "^entry=$family|" "$access_file" 2>/dev/null
+}
+
+confirm_whitelist_family_coverage() {
+    local access_file=$1
+    local missing=""
+    local confirm
+
+    rules_file_has_family "ipv4" && ! access_file_has_family "$access_file" "ipv4" && missing="${missing} IPv4"
+    rules_file_has_family "ipv6" && ! access_file_has_family "$access_file" "ipv6" && missing="${missing} IPv6"
+
+    [[ -n "$missing" ]] || return 0
+
+    echo -e "${YELLOW}警告：当前存在${missing} 转发规则，但白名单没有对应协议族的源 IP/CIDR。${PLAIN}"
+    echo -e "${YELLOW}启用后，这些协议族的转发流量会被全部阻断。${PLAIN}"
+    read -p "确认继续启用白名单？[y/n]: " confirm
+    [[ "$confirm" == "y" || "$confirm" == "Y" ]]
+}
+
+commit_access_file() {
+    local tmp_access=$1
+
+    create_state_backup "before-access-change" 1
+
+    if ACCESS_FILE="$tmp_access" write_config_from_rules "$RULES_FILE"; then
+        backup_file "$ACCESS_FILE"
+        mv "$tmp_access" "$ACCESS_FILE"
+        if apply_config_changes; then
+            show_apply_result
+            return 0
+        fi
+        return 1
+    fi
+
+    rm -f "$tmp_access"
+    return 1
+}
+
+configure_access_mode() {
+    local mode=$1
+    local label
+    local entries
+
+    if [ "$mode" = "whitelist" ]; then
+        label="白名单"
+        echo -e "${YELLOW}白名单模式：只有名单内源 IP/CIDR 可以访问本工具托管的转发端口。${PLAIN}"
+    else
+        label="黑名单"
+        echo -e "${YELLOW}黑名单模式：名单内源 IP/CIDR 会被拒绝访问本工具托管的转发端口。${PLAIN}"
+    fi
+
+    echo "请输入源 IP/CIDR，多个用空格或英文逗号分隔。"
+    echo "示例: 1.2.3.4 203.0.113.0/24 2409:abcd::/48"
+    read -p "$label 名单: " entries
+
+    if prepare_access_file "$mode" "$entries"; then
+        if [ "$mode" = "whitelist" ] && ! confirm_whitelist_family_coverage "$PREPARED_ACCESS_FILE"; then
+            rm -f "$PREPARED_ACCESS_FILE"
+            echo -e "${YELLOW}已取消启用白名单。${PLAIN}"
+            pause_and_access_control
+            return
+        fi
+
+        if commit_access_file "$PREPARED_ACCESS_FILE"; then
+            echo -e "${GREEN}$label 已启用。${PLAIN}"
+        fi
+    fi
+    pause_and_access_control
+}
+
+disable_access_control() {
+    if prepare_access_file "off" "" && commit_access_file "$PREPARED_ACCESS_FILE"; then
+        echo -e "${GREEN}访问控制已关闭。${PLAIN}"
+    fi
+    pause_and_access_control
+}
+
+access_control_menu() {
+    clear
+    echo -e "${YELLOW}=== 访问控制（白名单/黑名单） ===${PLAIN}"
+    echo "说明：白名单和黑名单二选一，只限制本工具托管的转发端口，不影响 SSH 等其它服务。"
+    echo "注意：名单只支持源 IP/CIDR，不支持 DDNS 域名。"
+    echo "访问记录是当前规则加载后的运行期记录，规则重载、服务重启或重新生成配置后会清空。"
+    echo "--------------------------------"
+    show_access_control
+    echo "--------------------------------"
+    echo "1. 启用白名单模式"
+    echo "2. 启用黑名单模式"
+    echo "3. 关闭访问控制"
+    echo "4. 查看访问记录并加入黑名单"
+    echo "5. 清空访问记录"
+    echo "6. 查看历史访问记录"
+    echo "7. 清空历史访问记录"
+    echo "0. 返回主菜单"
+    read -p "请输入数字: " choice
+
+    case "$choice" in
+        1) configure_access_mode whitelist ;;
+        2) configure_access_mode blacklist ;;
+        3) disable_access_control ;;
+        4) ban_observed_sources_menu ;;
+        5) clear_observed_sources ;;
+        6) show_access_history ;;
+        7) clear_access_history ;;
+        0) main_menu ;;
+        *) echo -e "${RED}请输入正确的数字。${PLAIN}"; sleep 1; access_control_menu ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Backup and restore workflows
+# -----------------------------------------------------------------------------
+
+list_backups() {
+    local count=0
+    local file
+    local files=()
+
+    ensure_state_dir
+    echo -e "${YELLOW}=== 可用备份 ===${PLAIN}"
+    mapfile -t files < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'nftpf-backup-*.tar.gz' -printf '%T@\t%p\n' 2>/dev/null | sort -rn | cut -f2-)
+    for file in "${files[@]}"; do
+        count=$((count + 1))
+        echo "$count. $file"
+    done
+
+    if [ "$count" -eq 0 ]; then
+        echo -e "${YELLOW}暂无备份。${PLAIN}"
+        return 1
+    fi
+}
+
+validate_backup_archive() {
+    local backup_path=$1
+    local entry
+    local normalized
+    local listing
+
+    if ! listing=$(tar -tzf "$backup_path" 2>/dev/null); then
+        echo -e "${RED}错误：备份文件不是有效的 tar.gz 归档。${PLAIN}"
+        return 1
+    fi
+
+    if tar -tvzf "$backup_path" 2>/dev/null | awk '$1 ~ /^[lh]/ { found=1 } END { exit found ? 1 : 0 }'; then
+        :
+    else
+        echo -e "${RED}错误：备份归档包含链接文件，已拒绝导入。${PLAIN}"
+        return 1
+    fi
+
+    while IFS= read -r entry; do
+        normalized=${entry#./}
+        normalized=${normalized%/}
+        [[ -z "$normalized" ]] && continue
+
+        if [[ "$normalized" == /* || "$normalized" == *".."* ]]; then
+            echo -e "${RED}错误：备份归档包含不安全路径：$entry${PLAIN}"
+            return 1
+        fi
+
+        case "$normalized" in
+            rules.db|access.conf|access-history.log|nftables.conf|meta.txt) ;;
+            *)
+                echo -e "${RED}错误：备份归档包含未知文件：$entry${PLAIN}"
+                return 1
+                ;;
+        esac
+    done <<< "$listing"
+}
+
+restore_backup_path() {
+    local backup_path=$1
+    local tmp_dir
+    local tmp_access
+
+    if [ ! -f "$backup_path" ]; then
+        echo -e "${RED}错误：备份文件不存在。${PLAIN}"
+        return 1
+    fi
+
+    command -v tar >/dev/null 2>&1 || {
+        echo -e "${RED}错误：未找到 tar，无法导入备份。${PLAIN}"
+        return 1
+    }
+
+    validate_backup_archive "$backup_path" || return 1
+
+    tmp_dir=$(mktemp -d) || return 1
+    if ! tar -xzf "$backup_path" -C "$tmp_dir"; then
+        rm -rf "$tmp_dir"
+        echo -e "${RED}错误：备份解压失败。${PLAIN}"
+        return 1
+    fi
+
+    if [ ! -f "$tmp_dir/rules.db" ]; then
+        rm -rf "$tmp_dir"
+        echo -e "${RED}错误：备份中缺少 rules.db。${PLAIN}"
+        return 1
+    fi
+
+    if [ ! -f "$tmp_dir/access.conf" ]; then
+        tmp_access="$tmp_dir/access.conf"
+        echo "mode=off" > "$tmp_access"
+    fi
+
+    create_state_backup "before-restore" 1
+
+    if ACCESS_FILE="$tmp_dir/access.conf" write_config_from_rules "$tmp_dir/rules.db"; then
+        cp "$tmp_dir/rules.db" "$RULES_FILE"
+        cp "$tmp_dir/access.conf" "$ACCESS_FILE"
+        if [ -f "$tmp_dir/access-history.log" ]; then
+            cp "$tmp_dir/access-history.log" "$ACCESS_HISTORY_FILE"
+            chmod 600 "$ACCESS_HISTORY_FILE" 2>/dev/null || true
+        fi
+        if apply_config_changes; then
+            show_apply_result
+            echo -e "${GREEN}备份已导入并应用: $backup_path${PLAIN}"
+            rm -rf "$tmp_dir"
+            return 0
+        fi
+    fi
+
+    rm -rf "$tmp_dir"
+    return 1
+}
+
+restore_latest_backup() {
+    local latest="$BACKUP_DIR/latest.tar.gz"
+
+    if [ ! -f "$latest" ]; then
+        echo -e "${RED}错误：没有找到最近一次备份。${PLAIN}"
+        pause_and_return
+        return
+    fi
+
+    restore_backup_path "$latest"
+    pause_and_return
+}
+
+import_backup_menu() {
+    local path
+
+    read -p "请输入备份文件路径 (.tar.gz): " path
+    [[ -n "$path" ]] || { echo -e "${RED}错误：路径不能为空。${PLAIN}"; pause_and_return; return; }
+
+    restore_backup_path "$path"
+    pause_and_return
+}
+
+clear_backups_menu() {
+    local confirm
+    local files=()
+
+    ensure_state_dir
+    echo -e "${RED}警告：此操作将删除所有 nftpf 备份文件，删除后不能通过备份菜单回滚。${PLAIN}"
+    read -p "确认清空备份？[y/n]: " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}已取消。${PLAIN}"
+        pause_and_return
+        return
+    fi
+
+    shopt -s nullglob
+    files=("$BACKUP_DIR"/nftpf-backup-*.tar.gz "$BACKUP_DIR/latest.tar.gz" "$BACKUP_DIR/latest-auto.tar.gz" "$BACKUP_DIR/latest-manual.tar.gz")
+    shopt -u nullglob
+
+    if [ "${#files[@]}" -eq 0 ]; then
+        echo -e "${YELLOW}暂无备份可清空。${PLAIN}"
+    else
+        rm -f -- "${files[@]}"
+        echo -e "${GREEN}已清空 ${#files[@]} 个备份文件。${PLAIN}"
+    fi
+
+    pause_and_return
+}
+
+backup_restore_menu() {
+    clear
+    echo -e "${YELLOW}=== 备份 / 导入 / 回滚 ===${PLAIN}"
+    echo "说明：备份包含规则库、访问控制名单和当前 nftables 配置。"
+    echo "每次修改规则或访问控制前，脚本都会自动创建上一次状态备份，方便回滚。"
+    echo "--------------------------------"
+    echo "1. 创建当前备份"
+    echo "2. 导入备份文件"
+    echo "3. 回滚到最近一次备份"
+    echo "4. 查看备份列表"
+    echo "5. 清空备份"
+    echo "0. 返回主菜单"
+    read -p "请输入数字: " choice
+
+    case "$choice" in
+        1) create_state_backup "manual"; pause_and_return ;;
+        2) import_backup_menu ;;
+        3) restore_latest_backup ;;
+        4) list_backups; pause_and_return ;;
+        5) clear_backups_menu ;;
+        0) main_menu ;;
+        *) echo -e "${RED}请输入正确的数字。${PLAIN}"; sleep 1; backup_restore_menu ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Status and interactive menu
+# -----------------------------------------------------------------------------
+
 get_status() {
+    local access_mode
+    local access_count
+
     if find_nft_cmd; then
         local ver
         ver=$("$REAL_NFT_CMD" --version | awk '{print $2}')
@@ -1539,6 +2560,21 @@ get_status() {
     else
         FW_STATUS="${RED}未开启${PLAIN}"
     fi
+
+    access_mode=$(get_access_mode)
+    access_count=$(access_entry_count)
+    case "$access_mode" in
+        whitelist) ACCESS_STATUS="${GREEN}白名单 ($access_count)${PLAIN}" ;;
+        blacklist) ACCESS_STATUS="${YELLOW}黑名单 ($access_count)${PLAIN}" ;;
+        *) ACCESS_STATUS="${GREEN}关闭${PLAIN}" ;;
+    esac
+}
+
+show_rules_overview() {
+    echo -e "${YELLOW}当前转发规则:${PLAIN}"
+    if ! list_rules_compact; then
+        echo -e "${YELLOW}暂无转发规则。${PLAIN}"
+    fi
 }
 
 main_menu() {
@@ -1546,20 +2582,23 @@ main_menu() {
     get_status
     echo -e "################################################"
     echo -e "#           NFT Port Forwarding Tool           #"
-    echo -e "#          系统: ${SYS_TYPE}        #"
+    echo -e "#            NFT端口转发简易化工具             #"
     echo -e "################################################"
     echo -e "Nftables 状态: ${INSTALL_STATUS}"
     echo -e "服务运行 状态: ${RUN_STATUS}"
     echo -e "IP转发   状态: ${FW_STATUS}"
-    echo -e "提示: 输入 nftpf 可快速启动本脚本"
+    echo -e "访问控制 状态: ${ACCESS_STATUS}"
+    echo -e "${YELLOW}提示: 输入 nftpf 可快速启动本脚本${PLAIN}"
     echo -e "${YELLOW}注意: 本工具生成配置时包含 flush ruleset，会清空当前 nftables 规则集。${PLAIN}"
+    echo -e "################################################"
+    show_rules_overview
     echo -e "################################################"
     echo -e " 1. 添加端口转发规则"
     echo -e " 2. 添加端口段转发规则"
-    echo -e " 3. 查看现有转发规则"
-    echo -e " 4. 快速修改转发规则"
-    echo -e " 5. 删除转发规则"
-    echo -e " 6. 清空所有规则"
+    echo -e " 3. 快速修改转发规则"
+    echo -e " 4. 删除转发规则"
+    echo -e " 5. 清空所有规则"
+    echo -e " 6. 备份 / 导入 / 回滚"
     echo -e "------------------------------------------------"
     echo -e " 7. 设置开机自启"
     echo -e " 8. 取消开机自启"
@@ -1567,9 +2606,10 @@ main_menu() {
     echo -e "10. 停止服务"
     echo -e "11. 重启服务"
     echo -e "------------------------------------------------"
-    echo -e "12. 刷新 DDNS 规则"
-    echo -e "13. 启用 DDNS 自动刷新"
-    echo -e "14. 关闭 DDNS 自动刷新"
+    echo -e "12. 访问控制（白名单/黑名单）"
+    echo -e "13. 刷新 DDNS 规则"
+    echo -e "14. 启用 DDNS 自动刷新"
+    echo -e "15. 关闭 DDNS 自动刷新"
     echo -e " 0. 退出脚本"
     echo -e "################################################"
     read -p "请输入数字: " choice
@@ -1577,18 +2617,19 @@ main_menu() {
     case "$choice" in
         1) add_single_rule ;;
         2) add_range_rule ;;
-        3) view_rules ;;
-        4) quick_edit_rule ;;
-        5) delete_rule ;;
-        6) clear_config ;;
+        3) quick_edit_rule ;;
+        4) delete_rule ;;
+        5) clear_config ;;
+        6) backup_restore_menu ;;
         7) manage_service enable ;;
         8) manage_service disable ;;
         9) manage_service start ;;
         10) manage_service stop ;;
         11) manage_service restart ;;
-        12) refresh_ddns_menu ;;
-        13) enable_ddns_auto_refresh ;;
-        14) disable_ddns_auto_refresh ;;
+        12) access_control_menu ;;
+        13) refresh_ddns_menu ;;
+        14) enable_ddns_auto_refresh ;;
+        15) disable_ddns_auto_refresh ;;
         0) echo -e "${GREEN}谢谢使用。${PLAIN}"; exit 0 ;;
         *) echo -e "${RED}请输入正确的数字。${PLAIN}"; sleep 1; main_menu ;;
     esac
