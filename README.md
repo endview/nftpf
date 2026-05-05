@@ -21,7 +21,7 @@
 ## Quick Start
 
 ```bash
-curl -o nftpf.sh https://raw.githubusercontent.com/endview/nftpf/main/nftpf.sh
+curl -L -o nftpf.sh https://github.com/endview/nftpf/releases/latest/download/nftpf.sh
 chmod +x nftpf.sh
 sudo bash nftpf.sh
 ```
