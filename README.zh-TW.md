@@ -12,7 +12,7 @@
 - 寫入設定前自動校驗 nftables 語法。
 - 規則變更後自動啟動或重新啟動 nftables 服務，使設定立即生效。
 - 啟動時自動偵測並修復本工具託管的 nftables 設定漂移。
-- 支援 DDNS 手動刷新和 cron 自動刷新。
+- 支援 DDNS 手動刷新和 systemd timer 自動刷新。
 - 支援白名單/黑名單二選一的存取控制，只限制本工具託管的轉發連接埠。
 - 記錄託管轉發連接埠的近期來源 IP 命中次數，使用者可手動選擇可疑 IP 加入黑名單。
 - 支援託管規則和存取控制設定的備份、匯入和回滾。
@@ -46,17 +46,19 @@ flush ruleset
 
 當目標地址是網域時，工具會保存原始網域和目前解析到的 IP。你可以在選單裡手動刷新，也可以啟用自動刷新。
 
-自動刷新使用 cron，並包含固定 `PATH` 和 `flock`，避免多個刷新任務重疊執行。
+自動刷新使用 systemd timer，可以支援 `30s`、`0.5m` 這類一分鐘以下的間隔；服務內包含固定 `PATH`，並優先使用 `flock` 避免多個刷新任務重疊執行。
 
-範例 cron：
+範例 timer：
 
-```cron
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-*/5 * * * * root flock -n /run/nftpf.lock "/usr/local/bin/nftpf" --refresh-ddns >/dev/null 2>&1
+```ini
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=nftpf-ddns.service
 ```
 
-啟用自動刷新時，可以在互動式選單中自訂刷新間隔，預設是 5 分鐘。
+啟用自動刷新時，可以在互動式選單中自訂刷新間隔，預設是 5 分鐘；不帶單位的數字仍按分鐘處理。
 
 ## 存取控制
 
@@ -84,7 +86,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 - `bash`。
 - `nftables`。
 - `iproute2`。
-- 選用：`util-linux` 中的 `flock`，用於 DDNS cron 防重疊執行。
+- 選用：`util-linux` 中的 `flock`，用於 DDNS 刷新防重疊執行。
 
 ## 授權
 

@@ -12,7 +12,7 @@
 - Automatically validate nftables configuration before applying changes.
 - Automatically apply changes by starting or restarting the nftables service.
 - Detect and repair managed nftables configuration drift on startup.
-- Support DDNS refresh with optional cron automation.
+- Support DDNS refresh with optional systemd timer automation.
 - Support mutually exclusive whitelist/blacklist access control for managed forwarding ports.
 - Record recent source IP hit counts for managed forwarding ports, then let the user manually add suspicious IPs to the blacklist.
 - Support backup, import, and rollback for managed rules and access-control settings.
@@ -44,14 +44,16 @@ That means this tool rewrites the current nftables ruleset when applying managed
 
 ## DDNS Refresh
 
-Domain targets are stored with their resolved IP address. You can refresh them manually from the menu, or enable automatic refresh. The cron entry includes a fixed `PATH` and `flock` lock to avoid overlapping refresh jobs.
+Domain targets are stored with their resolved IP address. You can refresh them manually from the menu, or enable automatic refresh. Automatic refresh is managed by a systemd timer, so sub-minute intervals such as `30s` or `0.5m` are supported.
 
-Example generated cron:
+Example generated timer:
 
-```cron
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-*/5 * * * * root flock -n /run/nftpf.lock "/usr/local/bin/nftpf" --refresh-ddns >/dev/null 2>&1
+```ini
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=nftpf-ddns.service
 ```
 
 ## Access Control
@@ -80,7 +82,7 @@ Before changing forwarding rules or access-control settings, `nftpf` automatical
 - `bash`.
 - `nftables`.
 - `iproute2`.
-- Optional: `flock` from `util-linux` for DDNS cron locking.
+- Optional: `flock` from `util-linux` for DDNS refresh locking.
 
 ## License
 

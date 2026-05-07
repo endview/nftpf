@@ -13,6 +13,8 @@ BACKUP_DIR="${BACKUP_DIR:-$STATE_DIR/backups}"
 ACCESS_HISTORY_FILE="${ACCESS_HISTORY_FILE:-$STATE_DIR/access-history.log}"
 SHORTCUT_PATH="${SHORTCUT_PATH:-/usr/local/bin/nftpf}"
 CRON_FILE="${CRON_FILE:-/etc/cron.d/nft-port-forward-ddns}"
+DDNS_SERVICE_FILE="${DDNS_SERVICE_FILE:-/etc/systemd/system/nftpf-ddns.service}"
+DDNS_TIMER_FILE="${DDNS_TIMER_FILE:-/etc/systemd/system/nftpf-ddns.timer}"
 SERVICE_NAME="nftables"
 REAL_NFT_CMD="${REAL_NFT_CMD:-}"
 APPLY_RESULT=""
@@ -1373,8 +1375,10 @@ commit_rules_file() {
 
     if apply_config_changes; then
         show_apply_result
+        return 0
     else
         echo -e "${YELLOW}规则已保存，但服务未成功应用；修复问题后可使用“重启服务”。${PLAIN}"
+        return 1
     fi
 }
 
@@ -1784,19 +1788,30 @@ refresh_ddns() {
     local line
     local new_ip
     local changed=0
+    local changed_count=0
     local failed=0
+    local domain_count=0
+    local resolved_count=0
+    local old_ip
 
     tmp_rules=$(mktemp) || return 1
+
+    echo -e "${YELLOW}正在检查 DDNS/域名目标规则...${PLAIN}"
 
     while IFS= read -r line; do
         [[ -z "$line" || "$line" == \#* ]] && continue
         read_rule_fields "$line"
 
         if [ "$R_TARGET_TYPE" = "domain" ]; then
+            domain_count=$((domain_count + 1))
+            old_ip="$R_RESOLVED_IP"
             if new_ip=$(resolve_domain "$R_TARGET_HOST" "$R_FAMILY"); then
-                if [[ "$new_ip" != "$R_RESOLVED_IP" ]]; then
+                resolved_count=$((resolved_count + 1))
+                if [[ "$new_ip" != "$old_ip" ]]; then
+                    echo -e "[$R_ID] $R_TARGET_HOST: ${YELLOW}$old_ip -> $new_ip${PLAIN}"
                     R_RESOLVED_IP="$new_ip"
                     changed=1
+                    changed_count=$((changed_count + 1))
                 fi
             else
                 echo -e "${YELLOW}警告：$R_TARGET_HOST 解析失败，保留旧地址 $R_RESOLVED_IP。${PLAIN}"
@@ -1809,15 +1824,25 @@ refresh_ddns() {
 
     if [ "$changed" -eq 0 ]; then
         rm -f "$tmp_rules"
-        echo -e "${GREEN}DDNS 检查完成，没有需要更新的规则。${PLAIN}"
-        [ "$failed" -gt 0 ] && return 1
+        if [ "$domain_count" -eq 0 ]; then
+            echo -e "${YELLOW}没有发现 DDNS/域名目标规则，无需刷新 nftables。${PLAIN}"
+        elif [ "$resolved_count" -eq 0 ]; then
+            echo -e "${RED}错误：所有 DDNS/域名目标均解析失败；已跳过 nftables 刷新。${PLAIN}"
+            return 1
+        else
+            echo -e "${GREEN}DDNS 检查完成，没有发现解析变化；已跳过 nftables 刷新。${PLAIN}"
+        fi
         return 0
     fi
 
+    echo -e "${YELLOW}发现 $changed_count 条 DDNS 变化，正在重新生成并应用 nftables 配置...${PLAIN}"
     if commit_rules_file "$tmp_rules"; then
         echo -e "${GREEN}DDNS 已更新并重新应用配置。${PLAIN}"
         return 0
     fi
+
+    echo -e "${RED}错误：DDNS 已检测到变化，但 nftables 配置应用失败。${PLAIN}"
+    return 1
 }
 
 refresh_ddns_menu() {
@@ -1825,10 +1850,71 @@ refresh_ddns_menu() {
     pause_and_return
 }
 
+parse_ddns_interval_seconds() {
+    local raw=$1
+    local value
+    local unit
+    local seconds
+
+    raw=$(echo "$raw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    raw=${raw:-5m}
+
+    if [[ "$raw" =~ ^([0-9]+([.][0-9]+)?)(s|sec|secs|second|seconds|秒)$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        unit="s"
+    elif [[ "$raw" =~ ^([0-9]+([.][0-9]+)?)(m|min|mins|minute|minutes|分钟|分)?$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        unit="m"
+    elif [[ "$raw" =~ ^([0-9]+([.][0-9]+)?)(h|hour|hours|小时|时)$ ]]; then
+        value="${BASH_REMATCH[1]}"
+        unit="h"
+    else
+        return 1
+    fi
+
+    seconds=$(awk -v value="$value" -v unit="$unit" 'BEGIN {
+        if (unit == "s") {
+            result = value
+        } else if (unit == "h") {
+            result = value * 3600
+        } else {
+            result = value * 60
+        }
+        printf "%d", result + 0.999999
+    }' 2>/dev/null)
+
+    [[ "$seconds" =~ ^[0-9]+$ ]] || return 1
+    [ "$seconds" -ge 10 ] || return 1
+    [ "$seconds" -le 86400 ] || return 1
+
+    echo "$seconds"
+}
+
+format_ddns_interval() {
+    local seconds=$1
+
+    if [ $((seconds % 3600)) -eq 0 ]; then
+        echo "$((seconds / 3600)) 小时"
+    elif [ $((seconds % 60)) -eq 0 ]; then
+        echo "$((seconds / 60)) 分钟"
+    else
+        echo "$seconds 秒"
+    fi
+}
+
+systemd_quote_arg() {
+    printf '"%s"' "$(printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+
 enable_ddns_auto_refresh() {
     local command_path
     local interval
-    local cron_expr
+    local interval_seconds
+    local interval_display
+    local command_arg
+    local exec_command
+    local flock_path
+    local old_cron_exists=0
 
     command_path="$SHORTCUT_PATH"
     if [ ! -x "$command_path" ]; then
@@ -1837,37 +1923,96 @@ enable_ddns_auto_refresh() {
         command_path=$(realpath "$command_path" 2>/dev/null || echo "$command_path")
     fi
 
-    read -p "请输入 DDNS 自动刷新间隔分钟数 (1-59，默认 5): " interval
-    interval=${interval:-5}
-    if [[ ! "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ] || [ "$interval" -gt 59 ]; then
-        echo -e "${RED}错误：刷新间隔必须是 1-59 之间的整数分钟。${PLAIN}"
+    echo -e "${YELLOW}提示：默认单位 min，如需秒级，示例：10s；也支持 0.5m、5m、1h。${PLAIN}"
+    read -p "请输入 DDNS 自动刷新间隔 (10s-24h，默认 5m): " interval
+    if ! interval_seconds=$(parse_ddns_interval_seconds "$interval"); then
+        echo -e "${RED}错误：刷新间隔格式无效，或超出 10 秒到 24 小时范围。${PLAIN}"
         pause_and_return
         return
     fi
-    cron_expr="*/$interval * * * *"
+    interval_display=$(format_ddns_interval "$interval_seconds")
 
     if [[ "${NFT_HELPER_TEST_MODE:-0}" == "1" ]]; then
-        echo -e "${GREEN}测试模式：已跳过 cron 写入。${PLAIN}"
+        echo -e "${GREEN}测试模式：已跳过 systemd timer 写入。${PLAIN}"
         pause_and_return
         return
     fi
 
-    if ! command -v flock >/dev/null 2>&1; then
-        echo -e "${YELLOW}警告：未找到 flock，建议安装 util-linux 以避免 DDNS 刷新任务重叠。${PLAIN}"
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo -e "${RED}错误：未找到 systemctl，无法启用秒级 DDNS 自动刷新。${PLAIN}"
+        pause_and_return
+        return
     fi
 
-cat > "$CRON_FILE" <<EOF
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-$cron_expr root flock -n /run/nftpf.lock "$command_path" --refresh-ddns >/dev/null 2>&1
+    command_arg=$(systemd_quote_arg "$command_path")
+    if flock_path=$(command -v flock 2>/dev/null); then
+        exec_command="$flock_path -n /run/nftpf.lock $command_arg --refresh-ddns"
+    else
+        echo -e "${YELLOW}警告：未找到 flock，建议安装 util-linux 以避免 DDNS 刷新任务重叠。${PLAIN}"
+        exec_command="$command_arg --refresh-ddns"
+    fi
+
+    [ -f "$CRON_FILE" ] && old_cron_exists=1
+
+cat > "$DDNS_SERVICE_FILE" <<EOF
+[Unit]
+Description=nftpf DDNS refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=$exec_command
+TimeoutStartSec=30s
 EOF
-    echo -e "${GREEN}已启用 DDNS 自动刷新（每 $interval 分钟）。${PLAIN}"
+
+cat > "$DDNS_TIMER_FILE" <<EOF
+[Unit]
+Description=nftpf DDNS auto refresh
+
+[Timer]
+OnBootSec=${interval_seconds}s
+OnUnitActiveSec=${interval_seconds}s
+AccuracySec=1s
+Unit=nftpf-ddns.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    if systemctl enable --now nftpf-ddns.timer >/dev/null 2>&1; then
+        if [ "$old_cron_exists" -eq 1 ]; then
+            rm -f "$CRON_FILE"
+            echo -e "${GREEN}已迁移到 systemd timer，并已删除旧 cron 自动刷新任务。${PLAIN}"
+        fi
+        echo -e "${GREEN}已启用 DDNS 自动刷新（每 $interval_display）。${PLAIN}"
+    else
+        systemctl status nftpf-ddns.timer --no-pager -l 2>/dev/null || true
+        echo -e "${RED}错误：DDNS 自动刷新启用失败。${PLAIN}"
+    fi
     pause_and_return
 }
 
 disable_ddns_auto_refresh() {
-    if [ -f "$CRON_FILE" ]; then
-        rm -f "$CRON_FILE"
+    local changed=0
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now nftpf-ddns.timer >/dev/null 2>&1 || true
+    fi
+
+    if [ -f "$CRON_FILE" ] || [ -f "$DDNS_SERVICE_FILE" ] || [ -f "$DDNS_TIMER_FILE" ]; then
+        rm -f "$CRON_FILE" "$DDNS_SERVICE_FILE" "$DDNS_TIMER_FILE"
+        changed=1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload
+        systemctl reset-failed nftpf-ddns.service nftpf-ddns.timer 2>/dev/null || true
+    fi
+
+    if [ "$changed" -eq 1 ]; then
         echo -e "${GREEN}已关闭 DDNS 自动刷新。${PLAIN}"
     else
         echo -e "${YELLOW}DDNS 自动刷新当前未启用。${PLAIN}"
