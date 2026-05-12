@@ -5,9 +5,12 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
+NFTPF_VERSION="${NFTPF_VERSION:-0.1.2}"
+UPDATE_URL="${UPDATE_URL:-https://github.com/endview/nftpf/releases/latest/download/nftpf.sh}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/nftables.conf}"
 STATE_DIR="${STATE_DIR:-/etc/nft-port-forward}"
 RULES_FILE="${RULES_FILE:-$STATE_DIR/rules.db}"
+LINES_FILE="${LINES_FILE:-$STATE_DIR/lines.db}"
 ACCESS_FILE="${ACCESS_FILE:-$STATE_DIR/access.conf}"
 BACKUP_DIR="${BACKUP_DIR:-$STATE_DIR/backups}"
 ACCESS_HISTORY_FILE="${ACCESS_HISTORY_FILE:-$STATE_DIR/access-history.log}"
@@ -15,19 +18,25 @@ SHORTCUT_PATH="${SHORTCUT_PATH:-/usr/local/bin/nftpf}"
 CRON_FILE="${CRON_FILE:-/etc/cron.d/nft-port-forward-ddns}"
 DDNS_SERVICE_FILE="${DDNS_SERVICE_FILE:-/etc/systemd/system/nftpf-ddns.service}"
 DDNS_TIMER_FILE="${DDNS_TIMER_FILE:-/etc/systemd/system/nftpf-ddns.timer}"
+ROUTE_SERVICE_FILE="${ROUTE_SERVICE_FILE:-/etc/systemd/system/nftpf-route.service}"
 SERVICE_NAME="nftables"
 REAL_NFT_CMD="${REAL_NFT_CMD:-}"
 APPLY_RESULT=""
 CONFIG_AUTO_REBUILT=0
-CONFIG_RENDER_VERSION="2"
+CONFIG_RENDER_VERSION="3"
 TRACK_TIMEOUT="${TRACK_TIMEOUT:-30m}"
 IPV6_ROUTE_MARK="${IPV6_ROUTE_MARK:-100}"
 IPV6_ROUTE_TABLE="${IPV6_ROUTE_TABLE:-100}"
 NFTPF_IPV6_ROUTEFIX="${NFTPF_IPV6_ROUTEFIX:-auto}"
 
 if [[ "${NFT_HELPER_SKIP_ROOT:-0}" != "1" && $EUID -ne 0 ]]; then
-    echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${PLAIN}"
-    exit 1
+    case "${1:-}" in
+        --help|-h|--tool-help|--version) ;;
+        *)
+            echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${PLAIN}"
+            exit 1
+            ;;
+    esac
 fi
 
 SYS_TYPE="Linux (systemd)"
@@ -95,6 +104,7 @@ ensure_state_dir() {
     mkdir -p "$STATE_DIR"
     mkdir -p "$BACKUP_DIR"
     touch "$RULES_FILE"
+    touch "$LINES_FILE"
     touch "$ACCESS_HISTORY_FILE"
     chmod 600 "$ACCESS_HISTORY_FILE" 2>/dev/null || true
     if [ ! -f "$ACCESS_FILE" ]; then
@@ -133,6 +143,7 @@ create_state_backup() {
     backup_path="$BACKUP_DIR/nftpf-backup-${timestamp}-${safe_reason}.tar.gz"
 
     [ -f "$RULES_FILE" ] && cp "$RULES_FILE" "$tmp_dir/rules.db"
+    [ -f "$LINES_FILE" ] && cp "$LINES_FILE" "$tmp_dir/lines.db"
     [ -f "$ACCESS_FILE" ] && cp "$ACCESS_FILE" "$tmp_dir/access.conf"
     [ -f "$ACCESS_HISTORY_FILE" ] && cp "$ACCESS_HISTORY_FILE" "$tmp_dir/access-history.log"
     [ -f "$CONFIG_FILE" ] && cp "$CONFIG_FILE" "$tmp_dir/nftables.conf"
@@ -141,6 +152,7 @@ create_state_backup() {
         echo "reason=$reason"
         echo "config_file=$CONFIG_FILE"
         echo "rules_file=$RULES_FILE"
+        echo "lines_file=$LINES_FILE"
         echo "access_file=$ACCESS_FILE"
         echo "access_history_file=$ACCESS_HISTORY_FILE"
     } > "$tmp_dir/meta.txt"
@@ -322,6 +334,136 @@ check_shortcut() {
         cp "$0" "$SHORTCUT_PATH"
         chmod +x "$SHORTCUT_PATH"
     fi
+}
+
+validate_update_candidate() {
+    local candidate=$1
+
+    if [ ! -s "$candidate" ]; then
+        echo -e "${RED}错误：下载的更新文件为空。${PLAIN}"
+        return 1
+    fi
+
+    if ! head -n 1 "$candidate" | grep -qx '#!/bin/bash'; then
+        echo -e "${RED}错误：更新文件不是有效的 bash 脚本。${PLAIN}"
+        return 1
+    fi
+
+    if ! grep -q 'NFT Port Forwarding Tool' "$candidate"; then
+        echo -e "${RED}错误：更新文件缺少 nftpf 标识。${PLAIN}"
+        return 1
+    fi
+
+    if ! grep -q 'main_menu()' "$candidate" || ! grep -q 'run_cli()' "$candidate"; then
+        echo -e "${RED}错误：更新文件缺少必要函数。${PLAIN}"
+        return 1
+    fi
+
+    if ! bash -n "$candidate"; then
+        echo -e "${RED}错误：更新文件语法校验失败。${PLAIN}"
+        return 1
+    fi
+}
+
+download_update_candidate() {
+    local destination=$1
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$destination" "$UPDATE_URL"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$destination" "$UPDATE_URL"
+    else
+        echo -e "${RED}错误：未找到 curl 或 wget，无法下载更新。${PLAIN}"
+        return 1
+    fi
+}
+
+pause_after_update() {
+    if [[ "${NFTPF_CLI_MODE:-0}" == "1" ]]; then
+        return 0
+    fi
+
+    pause_and_return
+}
+
+update_script() {
+    local current
+    local target
+    local tmp
+    local backup
+    local shortcut_backup=""
+    local timestamp
+    local confirm
+
+    current=$(realpath "$0" 2>/dev/null || echo "$0")
+    target="${NFTPF_UPDATE_TARGET:-$current}"
+    timestamp=$(date +%Y%m%d%H%M%S)
+    tmp=$(mktemp) || { echo -e "${RED}错误：无法创建临时文件。${PLAIN}"; pause_after_update; return 1; }
+
+    echo -e "${YELLOW}=== 更新脚本 ===${PLAIN}"
+    echo "当前版本: $NFTPF_VERSION"
+    echo "更新来源: $UPDATE_URL"
+    echo "目标脚本: $target"
+    echo -e "${YELLOW}说明：更新只替换脚本文件，不修改转发规则，不重启 nftables。${PLAIN}"
+    read -p "确认从 GitHub Releases latest 下载并更新？[y/N]: " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        rm -f "$tmp"
+        echo -e "${YELLOW}已取消更新。${PLAIN}"
+        pause_after_update
+        return 0
+    fi
+
+    if ! download_update_candidate "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}更新失败：无法下载更新文件。${PLAIN}"
+        pause_after_update
+        return 1
+    fi
+
+    if ! validate_update_candidate "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}更新失败：校验未通过，当前脚本未改变。${PLAIN}"
+        pause_after_update
+        return 1
+    fi
+
+    backup="${target}.bak.$timestamp"
+    if [ -f "$target" ]; then
+        cp "$target" "$backup" || {
+            rm -f "$tmp"
+            echo -e "${RED}更新失败：无法备份当前脚本。${PLAIN}"
+            pause_after_update
+            return 1
+        }
+    fi
+
+    if [ -f "$SHORTCUT_PATH" ] && [ "$(realpath "$SHORTCUT_PATH" 2>/dev/null || echo "$SHORTCUT_PATH")" != "$target" ]; then
+        shortcut_backup="${SHORTCUT_PATH}.bak.$timestamp"
+        cp "$SHORTCUT_PATH" "$shortcut_backup" 2>/dev/null || shortcut_backup=""
+    fi
+
+    if ! install -m 755 "$tmp" "$target"; then
+        [ -f "$backup" ] && cp "$backup" "$target" 2>/dev/null || true
+        rm -f "$tmp"
+        echo -e "${RED}更新失败：写入目标脚本失败，已尝试保留旧版本。${PLAIN}"
+        pause_after_update
+        return 1
+    fi
+
+    if [ "$target" != "$SHORTCUT_PATH" ]; then
+        if ! cp "$target" "$SHORTCUT_PATH" 2>/dev/null; then
+            [ -n "$shortcut_backup" ] && cp "$shortcut_backup" "$SHORTCUT_PATH" 2>/dev/null || true
+            echo -e "${YELLOW}警告：主脚本已更新，但快捷命令 $SHORTCUT_PATH 更新失败。${PLAIN}"
+        else
+            chmod +x "$SHORTCUT_PATH" 2>/dev/null || true
+        fi
+    fi
+
+    rm -f "$tmp"
+    echo -e "${GREEN}脚本更新完成。${PLAIN}"
+    [ -f "$backup" ] && echo -e "${YELLOW}旧版本备份: $backup${PLAIN}"
+    pause_after_update
+    return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -514,7 +656,139 @@ join_rule() {
 
 read_rule_fields() {
     local line=$1
-    IFS='|' read -r R_ID R_FAMILY R_LISTEN_IP R_LISTEN_START R_LISTEN_END R_TARGET_TYPE R_TARGET_HOST R_RESOLVED_IP R_TARGET_START R_TARGET_END R_MODE R_PROTOCOL <<< "$line"
+    IFS='|' read -r R_ID R_FAMILY R_LISTEN_IP R_LISTEN_START R_LISTEN_END R_TARGET_TYPE R_TARGET_HOST R_RESOLVED_IP R_TARGET_START R_TARGET_END R_MODE R_PROTOCOL R_LINE_ID R_ROUTE_MODE <<< "$line"
+    R_LINE_ID=${R_LINE_ID:-}
+    R_ROUTE_MODE=${R_ROUTE_MODE:-none}
+    case "$R_ROUTE_MODE" in
+        none|iifonly|managed) ;;
+        *) R_ROUTE_MODE="none" ;;
+    esac
+}
+
+join_line() {
+    local IFS='|'
+    echo "$*"
+}
+
+read_line_fields() {
+    local line=$1
+    IFS='|' read -r L_ID L_NAME L_IFNAME L_IPV4 L_IPV6 L_MODE L_MARK L_TABLE4 L_TABLE6 L_GW4 L_GW6 L_ENABLED <<< "$line"
+    L_MODE=${L_MODE:-iifonly}
+    L_ENABLED=${L_ENABLED:-1}
+    case "$L_MODE" in
+        iifonly|managed) ;;
+        *) L_MODE="iifonly" ;;
+    esac
+}
+
+validate_ifname_value() {
+    local ifname=$1
+
+    if [[ ! "$ifname" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+        echo -e "${RED}错误：网卡名只能包含字母、数字、点、下划线、冒号和短横线。${PLAIN}"
+        return 1
+    fi
+}
+
+next_line_id() {
+    local max=0
+    local line
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read_line_fields "$line"
+        [[ "$L_ID" =~ ^[0-9]+$ ]] || continue
+        [ "$L_ID" -gt "$max" ] && max=$L_ID
+    done < "$LINES_FILE"
+
+    echo $((max + 1))
+}
+
+find_line_by_id() {
+    local id=$1
+    local line
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read_line_fields "$line"
+        if [ "$L_ID" = "$id" ]; then
+            FOUND_LINE="$line"
+            return 0
+        fi
+    done < "$LINES_FILE"
+
+    return 1
+}
+
+line_display_from_fields() {
+    local label
+    local mode_label
+
+    label="${L_NAME:-$L_IFNAME}"
+    case "$L_MODE" in
+        managed) mode_label="托管路由" ;;
+        *) mode_label="仅入口绑定" ;;
+    esac
+
+    echo "$label / $L_IFNAME / IPv4:${L_IPV4:-无} / IPv6:${L_IPV6:-无} / $mode_label"
+}
+
+line_label_by_id() {
+    local id=$1
+
+    if [[ -n "$id" ]] && find_line_by_id "$id"; then
+        read_line_fields "$FOUND_LINE"
+        echo "${L_NAME:-$L_IFNAME}/$L_IFNAME"
+    else
+        echo "默认"
+    fi
+}
+
+line_match_from_current() {
+    if [[ -z "$R_LINE_ID" ]]; then
+        return 0
+    fi
+
+    if ! find_line_by_id "$R_LINE_ID"; then
+        echo "INVALID_NFTPF_MISSING_LINE_$R_LINE_ID "
+        return 0
+    fi
+
+    read_line_fields "$FOUND_LINE"
+    if [[ -z "$L_IFNAME" ]]; then
+        echo "INVALID_NFTPF_EMPTY_IFNAME_$R_LINE_ID "
+        return 0
+    fi
+
+    echo "iifname \"$L_IFNAME\" "
+}
+
+line_scopes_conflict() {
+    local left=${1:-}
+    local right=${2:-}
+
+    [[ -z "$left" || -z "$right" || "$left" == "$right" ]]
+}
+
+line_has_managed_rules_in_file() {
+    local rules_file=$1
+    local line
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read_rule_fields "$line"
+        [[ "$R_ROUTE_MODE" == "managed" && -n "$R_LINE_ID" ]] || continue
+        find_line_by_id "$R_LINE_ID" || continue
+        read_line_fields "$FOUND_LINE"
+        [[ "$L_MODE" == "managed" ]] && return 0
+    done < "$rules_file"
+
+    return 1
+}
+
+value_or_none() {
+    local value=$1
+    echo "${value:-无}"
 }
 
 next_rule_id() {
@@ -560,6 +834,7 @@ rule_conflicts_in_file() {
     local start=$4
     local end=$5
     local exclude_id=$6
+    local line_id=${7:-}
     local line
 
     listen_ip=$(normalize_listen_ip "$listen_ip")
@@ -570,6 +845,10 @@ rule_conflicts_in_file() {
 
         [[ "$R_ID" == "$exclude_id" ]] && continue
         [[ "$R_FAMILY" == "$family" ]] || continue
+
+        if ! line_scopes_conflict "$line_id" "$R_LINE_ID"; then
+            continue
+        fi
 
         if ! listen_ips_conflict "$listen_ip" "$R_LISTEN_IP"; then
             continue
@@ -799,10 +1078,13 @@ build_dnat_target() {
 }
 
 build_nft_rule_from_fields() {
+    local line_match
     local listen_match=""
     local port_expr
     local dnat_target
     local map_str
+
+    line_match=$(line_match_from_current)
 
     if [[ -n "$R_LISTEN_IP" ]]; then
         if [ "$R_FAMILY" = "ipv6" ]; then
@@ -828,7 +1110,7 @@ build_nft_rule_from_fields() {
         range_offset)
             dnat_target=$(build_dnat_target "$R_FAMILY" "$R_RESOLVED_IP" "")
             map_str=$(build_port_map "$R_LISTEN_START" "$R_LISTEN_END" "$R_TARGET_START")
-            echo "        ${listen_match}meta l4proto {tcp, udp} th dport $port_expr dnat to $dnat_target : th dport map $map_str"
+            echo "        ${line_match}${listen_match}meta l4proto {tcp, udp} th dport $port_expr dnat to $dnat_target : th dport map $map_str"
             return
             ;;
         *)
@@ -836,7 +1118,7 @@ build_nft_rule_from_fields() {
             ;;
     esac
 
-    echo "        ${listen_match}meta l4proto {tcp, udp} th dport $port_expr dnat to $dnat_target"
+    echo "        ${line_match}${listen_match}meta l4proto {tcp, udp} th dport $port_expr dnat to $dnat_target"
 }
 
 parse_dnat_target() {
@@ -942,7 +1224,7 @@ import_existing_rules_from_config() {
             [[ -n "$target_start" ]] || continue
         fi
 
-        join_rule "$id" "$family" "$listen_ip" "$listen_start" "$listen_end" "ip" "$PARSED_TARGET_HOST" "$PARSED_TARGET_HOST" "$target_start" "$target_end" "$mode" "tcp_udp" >> "$tmp_rules"
+        join_rule "$id" "$family" "$listen_ip" "$listen_start" "$listen_end" "ip" "$PARSED_TARGET_HOST" "$PARSED_TARGET_HOST" "$target_start" "$target_end" "$mode" "tcp_udp" "" "none" >> "$tmp_rules"
         id=$((id + 1))
         imported=$((imported + 1))
     done < "$CONFIG_FILE"
@@ -991,8 +1273,11 @@ rules_file_has_family() {
 }
 
 build_forward_match_from_current() {
+    local line_match
     local listen_match=""
     local port_expr
+
+    line_match=$(line_match_from_current)
 
     if [[ -n "$R_LISTEN_IP" ]]; then
         if [ "$R_FAMILY" = "ipv6" ]; then
@@ -1008,7 +1293,7 @@ build_forward_match_from_current() {
         port_expr="{ $R_LISTEN_START-$R_LISTEN_END }"
     fi
 
-    echo "${listen_match}meta l4proto {tcp, udp} th dport $port_expr"
+    echo "${line_match}${listen_match}meta l4proto {tcp, udp} th dport $port_expr"
 }
 
 collect_port_elements_for_family() {
@@ -1194,6 +1479,45 @@ render_access_tables() {
     render_access_table_for_family "$rules_file" "ipv6"
 }
 
+render_route_mark_table() {
+    local rules_file=$1
+    local line
+    local match
+    local mark
+    local rendered=0
+
+    line_has_managed_rules_in_file "$rules_file" || return 0
+
+    cat <<EOF
+table inet nftpf_route {
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        ct mark != 0 meta mark set ct mark
+EOF
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read_rule_fields "$line"
+        [[ "$R_ROUTE_MODE" == "managed" && -n "$R_LINE_ID" ]] || continue
+        find_line_by_id "$R_LINE_ID" || continue
+        read_line_fields "$FOUND_LINE"
+        [[ "$L_MODE" == "managed" && -n "$L_MARK" ]] || continue
+
+        mark="$L_MARK"
+        match=$(build_forward_match_from_current)
+        echo "        ct state new $match ct mark set $mark meta mark set $mark"
+        rendered=1
+    done < "$rules_file"
+
+    cat <<EOF
+    }
+}
+
+EOF
+
+    [ "$rendered" -eq 1 ]
+}
+
 generate_config_from_rules() {
     local rules_file=$1
     local mark_hex
@@ -1209,6 +1533,7 @@ flush ruleset
 EOF
     render_tracking_tables "$rules_file"
     render_access_tables "$rules_file"
+    render_route_mark_table "$rules_file"
     cat <<EOF
 table ip nat {
     chain prerouting {
@@ -1247,7 +1572,7 @@ EOF
 table ip6 nftpf_routefix {
     chain prerouting {
         type filter hook prerouting priority mangle; policy accept;
-        ct direction reply ct status dnat meta mark set $mark_hex
+        ct direction reply ct status dnat ct mark 0 meta mark set $mark_hex
     }
 }
 EOF
@@ -1482,8 +1807,28 @@ prepare_rule_record() {
     local target_start=$7
     local target_end=$8
     local family_choice=$9
+    local line_id=${10:-}
+    local route_mode=${11:-none}
 
     listen_ip=$(normalize_listen_ip "$listen_ip")
+    case "$route_mode" in
+        none|iifonly|managed) ;;
+        *) route_mode="none" ;;
+    esac
+
+    if [[ -n "$line_id" ]]; then
+        if ! find_line_by_id "$line_id"; then
+            echo -e "${RED}错误：入口线路不存在。${PLAIN}"
+            return 1
+        fi
+        read_line_fields "$FOUND_LINE"
+        if [ "$route_mode" = "managed" ] && [ "$L_MODE" != "managed" ]; then
+            echo -e "${RED}错误：该线路未启用托管回程路由，不能选择托管模式。${PLAIN}"
+            return 1
+        fi
+    else
+        route_mode="none"
+    fi
 
     collect_target_family "$target_host" "$listen_ip" "$family_choice" || {
         echo -e "${RED}错误：无法确定规则协议族，请检查监听地址或目标地址。${PLAIN}"
@@ -1497,12 +1842,68 @@ prepare_rule_record() {
         return 1
     fi
 
-    if rule_conflicts_in_file "$RULES_FILE" "$CHOSEN_FAMILY" "$listen_ip" "$listen_start" "$listen_end" "$id"; then
-        echo -e "${RED}错误：该监听 IP/端口范围与现有规则冲突。${PLAIN}"
+    if rule_conflicts_in_file "$RULES_FILE" "$CHOSEN_FAMILY" "$listen_ip" "$listen_start" "$listen_end" "$id" "$line_id"; then
+        echo -e "${RED}错误：该入口线路/监听 IP/端口范围与现有规则冲突。${PLAIN}"
         return 1
     fi
 
-    PREPARED_RECORD=$(join_rule "$id" "$CHOSEN_FAMILY" "$listen_ip" "$listen_start" "$listen_end" "$RESOLVED_TARGET_TYPE" "$target_host" "$RESOLVED_TARGET_IP" "$target_start" "$target_end" "$mode" "tcp_udp")
+    PREPARED_RECORD=$(join_rule "$id" "$CHOSEN_FAMILY" "$listen_ip" "$listen_start" "$listen_end" "$RESOLVED_TARGET_TYPE" "$target_host" "$RESOLVED_TARGET_IP" "$target_start" "$target_end" "$mode" "tcp_udp" "$line_id" "$route_mode")
+}
+
+lines_file_has_records() {
+    grep -q '^[^#[:space:]]' "$LINES_FILE" 2>/dev/null
+}
+
+list_lines_compact() {
+    local line
+    local count=0
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read_line_fields "$line"
+        echo "[$L_ID] $(line_display_from_fields)"
+        count=$((count + 1))
+    done < "$LINES_FILE"
+
+    [ "$count" -gt 0 ]
+}
+
+choose_line_for_rule() {
+    local bind_choice
+    local line_choice
+    local route_choice
+
+    SELECTED_LINE_ID=""
+    SELECTED_ROUTE_MODE="none"
+
+    lines_file_has_records || return 0
+
+    read -p "是否绑定入口线路/网卡？[y/N]: " bind_choice
+    [[ "$bind_choice" == "y" || "$bind_choice" == "Y" ]] || return 0
+
+    echo -e "${YELLOW}请选择入口线路:${PLAIN}"
+    list_lines_compact || return 0
+    echo "[0] 不绑定线路"
+    read -p "请输入线路 ID: " line_choice
+    [[ "$line_choice" == "0" || -z "$line_choice" ]] && return 0
+
+    if ! find_line_by_id "$line_choice"; then
+        echo -e "${RED}错误：入口线路不存在。${PLAIN}"
+        return 1
+    fi
+
+    read_line_fields "$FOUND_LINE"
+    SELECTED_LINE_ID="$L_ID"
+    SELECTED_ROUTE_MODE="iifonly"
+
+    if [ "$L_MODE" = "managed" ]; then
+        echo "[1] 仅绑定入口网卡（推荐）"
+        echo "[2] 绑定入口网卡 + 由 nftpf 托管回程路由（高级）"
+        read -p "请选择线路处理方式 [1/2] (默认 1): " route_choice
+        if [ "$route_choice" = "2" ]; then
+            SELECTED_ROUTE_MODE="managed"
+        fi
+    fi
 }
 
 add_single_rule() {
@@ -1523,9 +1924,10 @@ add_single_rule() {
 
     read -p "目标端口: " target_port
     validate_single_port "$target_port" "目标端口" || { pause_and_return; return; }
+    choose_line_for_rule || { pause_and_return; return; }
 
     id=$(next_rule_id)
-    prepare_rule_record "$id" "single" "$listen_ip" "$listen_port" "$listen_port" "$target_host" "$target_port" "$target_port" "auto" || { pause_and_return; return; }
+    prepare_rule_record "$id" "single" "$listen_ip" "$listen_port" "$listen_port" "$target_host" "$target_port" "$target_port" "auto" "$SELECTED_LINE_ID" "$SELECTED_ROUTE_MODE" || { pause_and_return; return; }
 
     if append_rule_record "$PREPARED_RECORD"; then
         echo -e "${GREEN}规则添加成功：ID $id${PLAIN}"
@@ -1576,9 +1978,10 @@ add_range_rule() {
         target_start="$listen_start"
         target_end="$listen_end"
     fi
+    choose_line_for_rule || { pause_and_return; return; }
 
     id=$(next_rule_id)
-    prepare_rule_record "$id" "$mode" "$listen_ip" "$listen_start" "$listen_end" "$target_host" "$target_start" "$target_end" "auto" || { pause_and_return; return; }
+    prepare_rule_record "$id" "$mode" "$listen_ip" "$listen_start" "$listen_end" "$target_host" "$target_start" "$target_end" "auto" "$SELECTED_LINE_ID" "$SELECTED_ROUTE_MODE" || { pause_and_return; return; }
 
     if append_rule_record "$PREPARED_RECORD"; then
         echo -e "${GREEN}端口段规则添加成功：ID $id${PLAIN}"
@@ -1591,6 +1994,7 @@ rule_summary_from_current() {
     local target_display
     local target_note=""
     local mode_text
+    local line_text
 
     if [ "$R_LISTEN_START" = "$R_LISTEN_END" ]; then
         listen_display=$(format_listen_display "$R_FAMILY" "$R_LISTEN_IP" "$R_LISTEN_START")
@@ -1615,7 +2019,12 @@ rule_summary_from_current() {
         *) mode_text="$R_MODE" ;;
     esac
 
-    echo "[$R_ID] [$R_FAMILY] [$mode_text] $listen_display -> $target_display"
+    line_text=$(line_label_by_id "$R_LINE_ID")
+    if [ "$R_ROUTE_MODE" = "managed" ]; then
+        line_text="${line_text}+route"
+    fi
+
+    echo "[$R_ID] [$R_FAMILY] [$mode_text] [$line_text] $listen_display -> $target_display"
 }
 
 view_rules() {
@@ -1692,6 +2101,9 @@ quick_edit_rule() {
     local mode_choice
     local count
     local family_default
+    local line_id
+    local route_mode
+    local change_line
 
     echo -e "${YELLOW}=== 快速修改转发规则 ===${PLAIN}"
     if ! list_rules_compact; then
@@ -1706,6 +2118,8 @@ quick_edit_rule() {
     read_rule_fields "$FOUND_RULE"
 
     family_default="$R_FAMILY"
+    line_id="$R_LINE_ID"
+    route_mode="$R_ROUTE_MODE"
     listen_ip=$(read_with_default "监听 IP (空=通配)" "$R_LISTEN_IP")
     listen_start=$(read_with_default "监听起始端口" "$R_LISTEN_START")
     listen_end=$(read_with_default "监听结束端口" "$R_LISTEN_END")
@@ -1746,7 +2160,17 @@ quick_edit_rule() {
         fi
     fi
 
-    prepare_rule_record "$id" "$mode" "$listen_ip" "$listen_start" "$listen_end" "$target_host" "$target_start" "$target_end" "$family_default" || { pause_and_return; return; }
+    if lines_file_has_records; then
+        echo -e "当前入口线路: ${GREEN}$(line_label_by_id "$line_id")${PLAIN}"
+        read -p "是否修改入口线路/网卡？[y/N]: " change_line
+        if [[ "$change_line" == "y" || "$change_line" == "Y" ]]; then
+            choose_line_for_rule || { pause_and_return; return; }
+            line_id="$SELECTED_LINE_ID"
+            route_mode="$SELECTED_ROUTE_MODE"
+        fi
+    fi
+
+    prepare_rule_record "$id" "$mode" "$listen_ip" "$listen_start" "$listen_end" "$target_host" "$target_start" "$target_end" "$family_default" "$line_id" "$route_mode" || { pause_and_return; return; }
 
     if update_rule_record "$id" "$PREPARED_RECORD"; then
         echo -e "${GREEN}规则修改成功。${PLAIN}"
@@ -1781,6 +2205,348 @@ delete_rule() {
         echo -e "${GREEN}规则已删除。${PLAIN}"
     fi
     pause_and_return
+}
+
+# -----------------------------------------------------------------------------
+# Line / multi-NIC workflows
+# -----------------------------------------------------------------------------
+
+detect_iface_ipv4() {
+    ip -o -4 addr show dev "$1" scope global 2>/dev/null | awk '{print $4; exit}' | cut -d/ -f1
+}
+
+detect_iface_ipv6() {
+    ip -o -6 addr show dev "$1" scope global 2>/dev/null | awk '$4 !~ /^fe80:/ {print $4; exit}' | cut -d/ -f1
+}
+
+detect_iface_gw4() {
+    ip -4 route show default dev "$1" 2>/dev/null | awk '/default/ {print $3; exit}'
+}
+
+detect_iface_gw6() {
+    ip -6 route show default dev "$1" 2>/dev/null | awk '/default/ {print $3; exit}'
+}
+
+next_line_table() {
+    echo $((100 + $1))
+}
+
+next_line_mark() {
+    printf "0x%x" $((0x100 + $1))
+}
+
+line_in_use() {
+    local line_id=$1
+    local line
+
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read_rule_fields "$line"
+        [[ "$R_LINE_ID" == "$line_id" ]] && return 0
+    done < "$RULES_FILE"
+
+    return 1
+}
+
+commit_lines_file() {
+    local tmp_lines=$1
+
+    create_state_backup "before-line-change" 1
+
+    if LINES_FILE="$tmp_lines" write_config_from_rules "$RULES_FILE"; then
+        mv "$tmp_lines" "$LINES_FILE"
+        if apply_config_changes; then
+            show_apply_result
+            return 0
+        fi
+        return 1
+    fi
+
+    rm -f "$tmp_lines"
+    return 1
+}
+
+show_lines() {
+    echo -e "${YELLOW}当前入口线路:${PLAIN}"
+    if ! list_lines_compact; then
+        echo -e "${YELLOW}暂无线路。${PLAIN}"
+        return 1
+    fi
+}
+
+pause_and_line_menu() {
+    echo ""
+    echo -e "${YELLOW}按下任意键返回线路管理...${PLAIN}"
+    read -n 1 -s -r
+    line_management_menu
+}
+
+scan_interfaces() {
+    local ifname
+    local ipv4
+    local ipv6
+    local gw4
+    local gw6
+    local count=0
+
+    echo -e "${YELLOW}=== 当前网卡和地址 ===${PLAIN}"
+    while IFS= read -r ifname; do
+        [[ -n "$ifname" && "$ifname" != "lo" ]] || continue
+        ipv4=$(detect_iface_ipv4 "$ifname")
+        ipv6=$(detect_iface_ipv6 "$ifname")
+        gw4=$(detect_iface_gw4 "$ifname")
+        gw6=$(detect_iface_gw6 "$ifname")
+        count=$((count + 1))
+        echo "[$count] $ifname"
+        echo "    IPv4: $(value_or_none "$ipv4")"
+        echo "    IPv6: $(value_or_none "$ipv6")"
+        echo "    IPv4 网关: $(value_or_none "$gw4")"
+        echo "    IPv6 网关: $(value_or_none "$gw6")"
+    done < <(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1)
+
+    [ "$count" -gt 0 ] || echo -e "${YELLOW}没有检测到可用网卡。${PLAIN}"
+    pause_and_line_menu
+}
+
+validate_line_values() {
+    local ifname=$1
+    local ipv4=$2
+    local ipv6=$3
+    local mode=$4
+    local mark=$5
+    local table4=$6
+    local table6=$7
+    local gw4=$8
+    local gw6=$9
+
+    validate_ifname_value "$ifname" || return 1
+    [[ -z "$ipv4" || "$(classify_host "$ipv4")" == "ipv4" ]] || { echo -e "${RED}错误：IPv4 地址无效。${PLAIN}"; return 1; }
+    [[ -z "$ipv6" || "$(classify_host "$ipv6")" == "ipv6" ]] || { echo -e "${RED}错误：IPv6 地址无效。${PLAIN}"; return 1; }
+    case "$mode" in iifonly|managed) ;; *) echo -e "${RED}错误：线路模式无效。${PLAIN}"; return 1 ;; esac
+
+    if [ "$mode" = "managed" ]; then
+        [[ "$mark" =~ ^0x[0-9A-Fa-f]+$|^[0-9]+$ ]] || { echo -e "${RED}错误：fwmark 必须是数字或 0x 十六进制。${PLAIN}"; return 1; }
+        [[ -z "$table4" || "$table4" =~ ^[0-9]+$ ]] || { echo -e "${RED}错误：IPv4 路由表 ID 必须是数字。${PLAIN}"; return 1; }
+        [[ -z "$table6" || "$table6" =~ ^[0-9]+$ ]] || { echo -e "${RED}错误：IPv6 路由表 ID 必须是数字。${PLAIN}"; return 1; }
+        [[ -z "$gw4" || "$(classify_host "$gw4")" == "ipv4" ]] || { echo -e "${RED}错误：IPv4 网关无效。${PLAIN}"; return 1; }
+        [[ -z "$gw6" || "$(classify_host "$gw6")" == "ipv6" ]] || { echo -e "${RED}错误：IPv6 网关无效。${PLAIN}"; return 1; }
+    fi
+}
+
+add_line() {
+    local id name ifname ipv4 ipv6 mode_choice tmp_lines confirm
+    local mode="iifonly"
+    local table4=""
+    local table6=""
+    local mark=""
+    local gw4=""
+    local gw6=""
+
+    echo -e "${YELLOW}=== 添加入口线路 ===${PLAIN}"
+    read -p "网卡名，例如 eth0/eth2/ens18: " ifname
+    validate_ifname_value "$ifname" || { pause_and_line_menu; return; }
+    ip link show dev "$ifname" >/dev/null 2>&1 || echo -e "${YELLOW}警告：当前系统没有检测到网卡 $ifname，仍可保存用于迁移或稍后修复。${PLAIN}"
+
+    name=$(read_with_default "线路名称（仅用于显示）" "$ifname")
+    ipv4=$(read_with_default "IPv4 地址（可空）" "$(detect_iface_ipv4 "$ifname")")
+    ipv6=$(read_with_default "IPv6 地址（可空）" "$(detect_iface_ipv6 "$ifname")")
+
+    echo "[1] 仅入口绑定（推荐，不修改系统路由）"
+    echo "[2] 托管回程路由（高级，会写 ip rule / route table）"
+    read -p "请选择线路模式 [1/2] (默认 1): " mode_choice
+    [ "$mode_choice" = "2" ] && mode="managed"
+
+    id=$(next_line_id)
+    if [ "$mode" = "managed" ]; then
+        mark=$(read_with_default "fwmark" "$(next_line_mark "$id")")
+        table4=$(read_with_default "IPv4 路由表 ID（无 IPv4 可空）" "$(next_line_table "$id")")
+        table6=$(read_with_default "IPv6 路由表 ID（无 IPv6 可空）" "$(next_line_table "$id")")
+        gw4=$(read_with_default "IPv4 网关（无 IPv4 可空）" "$(detect_iface_gw4 "$ifname")")
+        gw6=$(read_with_default "IPv6 网关（无 IPv6 可空）" "$(detect_iface_gw6 "$ifname")")
+        echo -e "${YELLOW}警告：托管回程路由会修改系统 ip rule / route table，仅建议多网卡 DIA 机器使用。${PLAIN}"
+        read -p "确认启用托管回程路由？[y/N]: " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            mode="iifonly"; mark=""; table4=""; table6=""; gw4=""; gw6=""
+        fi
+    fi
+
+    validate_line_values "$ifname" "$ipv4" "$ipv6" "$mode" "$mark" "$table4" "$table6" "$gw4" "$gw6" || { pause_and_line_menu; return; }
+    tmp_lines=$(mktemp) || { pause_and_line_menu; return; }
+    cat "$LINES_FILE" > "$tmp_lines"
+    join_line "$id" "$name" "$ifname" "$ipv4" "$ipv6" "$mode" "$mark" "$table4" "$table6" "$gw4" "$gw6" "1" >> "$tmp_lines"
+
+    commit_lines_file "$tmp_lines" && echo -e "${GREEN}线路已添加：$name / $ifname${PLAIN}"
+    pause_and_line_menu
+}
+
+edit_line() {
+    local id name ifname ipv4 ipv6 mode mark table4 table6 gw4 gw6 tmp_lines line
+
+    show_lines || { pause_and_line_menu; return; }
+    read -p "请输入要编辑的线路 ID (0 取消): " id
+    [[ "$id" == "0" ]] && { line_management_menu; return; }
+    find_line_by_id "$id" || { echo -e "${RED}错误：线路不存在。${PLAIN}"; pause_and_line_menu; return; }
+    read_line_fields "$FOUND_LINE"
+
+    name=$(read_with_default "线路名称" "$L_NAME")
+    ifname=$(read_with_default "网卡名" "$L_IFNAME")
+    ipv4=$(read_with_default "IPv4 地址（可空）" "$L_IPV4")
+    ipv6=$(read_with_default "IPv6 地址（可空）" "$L_IPV6")
+    mode=$(read_with_default "模式 iifonly/managed" "$L_MODE")
+    mark="$L_MARK"; table4="$L_TABLE4"; table6="$L_TABLE6"; gw4="$L_GW4"; gw6="$L_GW6"
+
+    if [ "$mode" = "managed" ]; then
+        mark=$(read_with_default "fwmark" "${mark:-$(next_line_mark "$id")}")
+        table4=$(read_with_default "IPv4 路由表 ID" "${table4:-$(next_line_table "$id")}")
+        table6=$(read_with_default "IPv6 路由表 ID" "${table6:-$(next_line_table "$id")}")
+        gw4=$(read_with_default "IPv4 网关（可空）" "$gw4")
+        gw6=$(read_with_default "IPv6 网关（可空）" "$gw6")
+    else
+        mark=""; table4=""; table6=""; gw4=""; gw6=""
+    fi
+
+    validate_line_values "$ifname" "$ipv4" "$ipv6" "$mode" "$mark" "$table4" "$table6" "$gw4" "$gw6" || { pause_and_line_menu; return; }
+    tmp_lines=$(mktemp) || { pause_and_line_menu; return; }
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && { echo "$line" >> "$tmp_lines"; continue; }
+        read_line_fields "$line"
+        if [ "$L_ID" = "$id" ]; then
+            join_line "$id" "$name" "$ifname" "$ipv4" "$ipv6" "$mode" "$mark" "$table4" "$table6" "$gw4" "$gw6" "1" >> "$tmp_lines"
+        else
+            echo "$line" >> "$tmp_lines"
+        fi
+    done < "$LINES_FILE"
+
+    commit_lines_file "$tmp_lines" && echo -e "${GREEN}线路已更新。${PLAIN}"
+    pause_and_line_menu
+}
+
+delete_line() {
+    local id tmp_lines line
+
+    show_lines || { pause_and_line_menu; return; }
+    read -p "请输入要删除的线路 ID (0 取消): " id
+    [[ "$id" == "0" ]] && { line_management_menu; return; }
+    find_line_by_id "$id" || { echo -e "${RED}错误：线路不存在。${PLAIN}"; pause_and_line_menu; return; }
+    if line_in_use "$id"; then
+        echo -e "${RED}错误：该线路仍被转发规则使用，请先修改或删除相关规则。${PLAIN}"
+        pause_and_line_menu
+        return
+    fi
+
+    tmp_lines=$(mktemp) || { pause_and_line_menu; return; }
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && { echo "$line" >> "$tmp_lines"; continue; }
+        read_line_fields "$line"
+        [ "$L_ID" = "$id" ] && continue
+        echo "$line" >> "$tmp_lines"
+    done < "$LINES_FILE"
+
+    commit_lines_file "$tmp_lines" && echo -e "${GREEN}线路已删除。${PLAIN}"
+    pause_and_line_menu
+}
+
+apply_managed_routes() {
+    local line priority applied=0 failed=0
+
+    command -v ip >/dev/null 2>&1 || { echo -e "${RED}错误：未找到 ip 命令。${PLAIN}"; return 1; }
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        read_line_fields "$line"
+        [[ "$L_MODE" == "managed" ]] || continue
+        priority=$((10100 + L_ID))
+        if [[ -n "$L_MARK" && -n "$L_TABLE4" && -n "$L_GW4" ]]; then
+            ip -4 rule del fwmark "$L_MARK" table "$L_TABLE4" priority "$priority" 2>/dev/null || true
+            if ip -4 rule add fwmark "$L_MARK" table "$L_TABLE4" priority "$priority" &&
+                ip -4 route replace default via "$L_GW4" dev "$L_IFNAME" table "$L_TABLE4"; then
+                applied=$((applied + 1))
+            else
+                failed=$((failed + 1))
+            fi
+        fi
+        if [[ -n "$L_MARK" && -n "$L_TABLE6" && -n "$L_GW6" ]]; then
+            ip -6 rule del fwmark "$L_MARK" table "$L_TABLE6" priority "$priority" 2>/dev/null || true
+            if ip -6 rule add fwmark "$L_MARK" table "$L_TABLE6" priority "$priority" &&
+                ip -6 route replace default via "$L_GW6" dev "$L_IFNAME" table "$L_TABLE6"; then
+                applied=$((applied + 1))
+            else
+                failed=$((failed + 1))
+            fi
+        fi
+    done < "$LINES_FILE"
+
+    if [ "$failed" -gt 0 ]; then
+        echo -e "${RED}错误：$failed 条托管路由应用失败。${PLAIN}"
+        return 1
+    fi
+
+    if [ "$applied" -eq 0 ]; then
+        echo -e "${YELLOW}没有需要应用的托管路由。${PLAIN}"
+    else
+        echo -e "${GREEN}托管路由已应用/修复。${PLAIN}"
+    fi
+}
+
+install_route_service() {
+    local command_path="$SHORTCUT_PATH"
+    local command_arg
+
+    if [ ! -x "$command_path" ]; then
+        command_path=$(realpath "$0" 2>/dev/null || echo "$0")
+    else
+        command_path=$(realpath "$command_path" 2>/dev/null || echo "$command_path")
+    fi
+    command_arg=$(systemd_quote_arg "$command_path")
+
+cat > "$ROUTE_SERVICE_FILE" <<EOF
+[Unit]
+Description=nftpf managed policy routes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$command_arg --apply-routes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable nftpf-route.service >/dev/null 2>&1 || true
+}
+
+apply_managed_routes_menu() {
+    if apply_managed_routes && command -v systemctl >/dev/null 2>&1; then
+        install_route_service
+    fi
+    pause_and_line_menu
+}
+
+line_management_menu() {
+    clear
+    echo -e "${YELLOW}=== 线路管理（多网卡/多 DIA） ===${PLAIN}"
+    echo "说明：普通 VPS 不需要配置线路；多网卡机器可用线路绑定入口网卡。"
+    echo "--------------------------------"
+    show_lines || true
+    echo "--------------------------------"
+    echo "1. 扫描网卡和地址"
+    echo "2. 添加线路"
+    echo "3. 编辑线路"
+    echo "4. 删除线路"
+    echo "5. 应用/修复托管路由"
+    echo "0. 返回主菜单"
+    read -p "请输入数字: " choice
+
+    case "$choice" in
+        1) scan_interfaces ;;
+        2) add_line ;;
+        3) edit_line ;;
+        4) delete_line ;;
+        5) apply_managed_routes_menu ;;
+        0) main_menu ;;
+        *) echo -e "${RED}请输入正确的数字。${PLAIN}"; sleep 1; line_management_menu ;;
+    esac
 }
 
 refresh_ddns() {
@@ -1819,7 +2585,7 @@ refresh_ddns() {
             fi
         fi
 
-        join_rule "$R_ID" "$R_FAMILY" "$R_LISTEN_IP" "$R_LISTEN_START" "$R_LISTEN_END" "$R_TARGET_TYPE" "$R_TARGET_HOST" "$R_RESOLVED_IP" "$R_TARGET_START" "$R_TARGET_END" "$R_MODE" "$R_PROTOCOL" >> "$tmp_rules"
+        join_rule "$R_ID" "$R_FAMILY" "$R_LISTEN_IP" "$R_LISTEN_START" "$R_LISTEN_END" "$R_TARGET_TYPE" "$R_TARGET_HOST" "$R_RESOLVED_IP" "$R_TARGET_START" "$R_TARGET_END" "$R_MODE" "$R_PROTOCOL" "$R_LINE_ID" "$R_ROUTE_MODE" >> "$tmp_rules"
     done < "$RULES_FILE"
 
     if [ "$changed" -eq 0 ]; then
@@ -2532,7 +3298,7 @@ validate_backup_archive() {
         fi
 
         case "$normalized" in
-            rules.db|access.conf|access-history.log|nftables.conf|meta.txt) ;;
+            rules.db|lines.db|access.conf|access-history.log|nftables.conf|meta.txt) ;;
             *)
                 echo -e "${RED}错误：备份归档包含未知文件：$entry${PLAIN}"
                 return 1
@@ -2575,11 +3341,15 @@ restore_backup_path() {
         tmp_access="$tmp_dir/access.conf"
         echo "mode=off" > "$tmp_access"
     fi
+    if [ ! -f "$tmp_dir/lines.db" ]; then
+        touch "$tmp_dir/lines.db"
+    fi
 
     create_state_backup "before-restore" 1
 
-    if ACCESS_FILE="$tmp_dir/access.conf" write_config_from_rules "$tmp_dir/rules.db"; then
+    if ACCESS_FILE="$tmp_dir/access.conf" LINES_FILE="$tmp_dir/lines.db" write_config_from_rules "$tmp_dir/rules.db"; then
         cp "$tmp_dir/rules.db" "$RULES_FILE"
+        cp "$tmp_dir/lines.db" "$LINES_FILE"
         cp "$tmp_dir/access.conf" "$ACCESS_FILE"
         if [ -f "$tmp_dir/access-history.log" ]; then
             cp "$tmp_dir/access-history.log" "$ACCESS_HISTORY_FILE"
@@ -2679,6 +3449,7 @@ backup_restore_menu() {
 get_status() {
     local access_mode
     local access_count
+    local line_count
 
     if find_nft_cmd; then
         local ver
@@ -2713,6 +3484,13 @@ get_status() {
         blacklist) ACCESS_STATUS="${YELLOW}黑名单 ($access_count)${PLAIN}" ;;
         *) ACCESS_STATUS="${GREEN}关闭${PLAIN}" ;;
     esac
+
+    line_count=$(grep -c '^[^#[:space:]]' "$LINES_FILE" 2>/dev/null || true)
+    if [ "$line_count" -gt 0 ]; then
+        LINE_STATUS="${GREEN}已配置 ($line_count)${PLAIN}"
+    else
+        LINE_STATUS="${GREEN}未配置${PLAIN}"
+    fi
 }
 
 show_rules_overview() {
@@ -2733,6 +3511,7 @@ main_menu() {
     echo -e "服务运行 状态: ${RUN_STATUS}"
     echo -e "IP转发   状态: ${FW_STATUS}"
     echo -e "访问控制 状态: ${ACCESS_STATUS}"
+    echo -e "入口线路 状态: ${LINE_STATUS}"
     echo -e "${YELLOW}提示: 输入 nftpf 可快速启动本脚本${PLAIN}"
     echo -e "${YELLOW}注意: 本工具生成配置时包含 flush ruleset，会清空当前 nftables 规则集。${PLAIN}"
     echo -e "################################################"
@@ -2755,6 +3534,8 @@ main_menu() {
     echo -e "13. 刷新 DDNS 规则"
     echo -e "14. 启用 DDNS 自动刷新"
     echo -e "15. 关闭 DDNS 自动刷新"
+    echo -e "16. 线路管理（多网卡/多 DIA）"
+    echo -e "17. 更新脚本"
     echo -e " 0. 退出脚本"
     echo -e "################################################"
     read -p "请输入数字: " choice
@@ -2775,6 +3556,8 @@ main_menu() {
         13) refresh_ddns_menu ;;
         14) enable_ddns_auto_refresh ;;
         15) disable_ddns_auto_refresh ;;
+        16) line_management_menu ;;
+        17) update_script ;;
         0) echo -e "${GREEN}谢谢使用。${PLAIN}"; exit 0 ;;
         *) echo -e "${RED}请输入正确的数字。${PLAIN}"; sleep 1; main_menu ;;
     esac
@@ -2790,11 +3573,28 @@ run_cli() {
             refresh_ddns
             exit $?
             ;;
+        --apply-routes)
+            check_ddns_runtime || exit 1
+            apply_managed_routes
+            exit $?
+            ;;
+        --update)
+            NFTPF_CLI_MODE=1
+            update_script
+            exit $?
+            ;;
+        --version)
+            echo "$NFTPF_VERSION"
+            exit 0
+            ;;
         --tool-help)
             echo "NFT Port Forwarding Tool"
             echo "Usage:"
             echo "  nftpf                  Open interactive forwarding menu"
             echo "  nftpf --refresh-ddns   Refresh DDNS/domain forwarding targets"
+            echo "  nftpf --apply-routes   Apply managed multi-NIC policy routes"
+            echo "  nftpf --update         Download and install latest nftpf script"
+            echo "  nftpf --version        Show current nftpf version"
             echo "  nftpf --tool-help      Show this help"
             exit 0
             ;;
@@ -2803,6 +3603,9 @@ run_cli() {
             echo "Usage:"
             echo "  nftpf                  Open interactive forwarding menu"
             echo "  nftpf --refresh-ddns   Refresh DDNS/domain forwarding targets"
+            echo "  nftpf --apply-routes   Apply managed multi-NIC policy routes"
+            echo "  nftpf --update         Download and install latest nftpf script"
+            echo "  nftpf --version        Show current nftpf version"
             echo "  nftpf --tool-help      Show this help"
             exit 0
             ;;

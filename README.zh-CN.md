@@ -17,6 +17,8 @@
 - 记录托管转发端口的近期源 IP 命中次数，用户可手动选择可疑 IP 加入黑名单。
 - 支持托管规则和访问控制设置的备份、导入和回滚。
 - 针对特殊 IPv6 网络环境，支持 `fd00::1` + policy routing table `100` 的 DNAT 回程路由修复。
+- 支持多网卡/多 DIA 入口线路，可按 `iifname` 绑定入口网卡，并可选托管 `fwmark` + 独立路由表。
+- 支持通过菜单 `17. 更新脚本` 或 `nftpf --update` 从 GitHub Release 更新脚本。
 
 ## 快速开始
 
@@ -70,9 +72,19 @@ Unit=nftpf-ddns.service
 
 规则重载前，当前观察列表会保存到 `/etc/nft-port-forward/access-history.log`。历史记录是辅助快照日志，不是实时审计日志，只保留最近 1000 行。
 
+## 多网卡 / 多 DIA
+
+普通 VPS 不需要配置入口线路。多网卡机器可以在“线路管理”中添加线路，例如 `IX / eth0`、`BGP / eth2`。添加转发规则时选择线路后，工具会生成 `iifname "eth0"` 这类入口网卡匹配，避免不同线路的同端口规则互相冲突。
+
+线路默认是“仅入口绑定”，不会修改系统路由。高级用户可以启用“托管回程路由”，由 `nftpf` 生成 `ct mark` / `meta mark` 规则，并通过 `nftpf --apply-routes` 应用对应的 `ip rule` 和独立路由表。该模式只建议多网卡 DIA 机器使用。
+
 ## 备份和回滚
 
 每次修改转发规则或访问控制设置前，`nftpf` 会自动在 `/etc/nft-port-forward/backups` 下创建备份。菜单也提供手动备份、导入备份，以及回滚到上一次自动备份。
+
+## 脚本更新
+
+可以使用菜单 `17. 更新脚本`，也可以运行 `nftpf --update`。更新会从 GitHub Releases 下载最新版 `nftpf.sh`，先校验脚本标识和 bash 语法，再备份当前脚本为 `.bak.<时间戳>` 后替换。更新脚本不会修改现有转发规则，也不会重启 nftables。
 
 ## 文件说明
 

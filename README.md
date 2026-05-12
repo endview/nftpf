@@ -17,6 +17,8 @@
 - Record recent source IP hit counts for managed forwarding ports, then let the user manually add suspicious IPs to the blacklist.
 - Support backup, import, and rollback for managed rules and access-control settings.
 - Add IPv6 DNAT return-route handling for special provider networks that use `fd00::1` plus policy routing table `100`.
+- Support multi-NIC / multi-DIA entry lines with optional `iifname` binding and managed `fwmark` + per-line routing tables.
+- Update the installed script from the latest GitHub Release through menu item `17` or `nftpf --update`.
 
 ## Quick Start
 
@@ -66,9 +68,19 @@ Whitelist/blacklist entries must be source IP addresses or CIDR ranges, such as 
 
 Before rules are reloaded, the current observation list is saved to `/etc/nft-port-forward/access-history.log`. The history file is an auxiliary snapshot log, not a real-time audit log, and only keeps the latest 1000 lines.
 
+## Multi-NIC / Multi-DIA
+
+Normal VPS users do not need to configure entry lines. On multi-NIC hosts, you can add lines such as `IX / eth0` or `BGP / eth2` from the line-management menu. When a forwarding rule is bound to a line, `nftpf` emits `iifname "eth0"` style matches so identical ports can coexist on different entry interfaces.
+
+The default line mode only binds the entry interface and does not change system routing. Advanced users can enable managed return routing, where `nftpf` emits `ct mark` / `meta mark` nftables rules and applies matching `ip rule` / per-line route tables through `nftpf --apply-routes`. Use this only on multi-DIA machines that need policy routing.
+
 ## Backup And Rollback
 
 Before changing forwarding rules or access-control settings, `nftpf` automatically creates a backup under `/etc/nft-port-forward/backups`. The menu also provides manual backup, import, and rollback to the latest automatic backup.
+
+## Script Update
+
+Use menu item `17. 更新脚本` or run `nftpf --update` to download the latest `nftpf.sh` from GitHub Releases. The updater validates the downloaded script and creates a `.bak.<timestamp>` backup before replacing the local script. Updating the script does not change forwarding rules and does not restart nftables.
 
 ## Files
 
