@@ -19,6 +19,7 @@
 - 針對特殊 IPv6 網路環境，支援 `fd00::1` + policy routing table `100` 的 DNAT 回程路由修復。
 - 支援多網卡/多 DIA 入口線路，可按 `iifname` 綁定入口網卡，並可選託管 `fwmark` + 獨立路由表。
 - 支援透過選單 `17. 更新腳本` 或 `nftpf --update` 從 GitHub Release 更新腳本。
+- 支援透過選單 `18. 卸載腳本` 卸載，並可選擇是否刪除備份檔案。
 
 ## 快速開始
 
@@ -85,6 +86,12 @@ Unit=nftpf-ddns.service
 ## 腳本更新
 
 可以使用選單 `17. 更新腳本`，也可以執行 `nftpf --update`。更新會從 GitHub Releases 下載最新版 `nftpf.sh`，先校驗腳本標識和 bash 語法，再備份目前腳本為 `.bak.<時間戳>` 後替換。更新腳本不會修改現有轉發規則，也不會重新啟動 nftables。
+
+## 卸載
+
+可以使用選單 `18. 卸載腳本`，也可以執行 `nftpf --uninstall`。卸載流程會清空目前 nftables ruleset，將 nftpf 託管設定重置為空規則，刪除 DDNS timer/service、舊 cron 任務、多網卡託管回程 service 和 nftpf 建立的 fwmark/ip rule/路由表，刪除狀態檔案，並刪除已安裝腳本和快捷命令。是否刪除備份檔案會單獨詢問，預設 `N` 保留。
+
+卸載不會刪除 `nftables` 套件，也不會關閉系統 IP 轉發 sysctl，因為這些可能被其它服務使用。
 
 ## 檔案說明
 

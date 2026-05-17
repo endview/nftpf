@@ -19,6 +19,7 @@
 - Add IPv6 DNAT return-route handling for special provider networks that use `fd00::1` plus policy routing table `100`.
 - Support multi-NIC / multi-DIA entry lines with optional `iifname` binding and managed `fwmark` + per-line routing tables.
 - Update the installed script from the latest GitHub Release through menu item `17` or `nftpf --update`.
+- Uninstall from menu item `18`, with optional backup deletion.
 
 ## Quick Start
 
@@ -81,6 +82,12 @@ Before changing forwarding rules or access-control settings, `nftpf` automatical
 ## Script Update
 
 Use menu item `17. 更新脚本` or run `nftpf --update` to download the latest `nftpf.sh` from GitHub Releases. The updater validates the downloaded script and creates a `.bak.<timestamp>` backup before replacing the local script. Updating the script does not change forwarding rules and does not restart nftables.
+
+## Uninstall
+
+Use menu item `18. 卸载脚本` or run `nftpf --uninstall` to remove nftpf. The uninstall flow clears the current nftables ruleset, resets nftpf-managed configuration to an empty ruleset, removes DDNS timers/services, removes managed policy-route services and rules, removes state files, and deletes the installed script/shortcut. Backup deletion is optional and defaults to `N`.
+
+The uninstall flow does not remove the `nftables` package and does not disable system IP forwarding sysctl settings, because those may be used by other services.
 
 ## Files
 

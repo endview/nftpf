@@ -5,7 +5,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-NFTPF_VERSION="${NFTPF_VERSION:-0.1.2}"
+NFTPF_VERSION="${NFTPF_VERSION:-0.1.3}"
 UPDATE_URL="${UPDATE_URL:-https://github.com/endview/nftpf/releases/latest/download/nftpf.sh}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/nftables.conf}"
 STATE_DIR="${STATE_DIR:-/etc/nft-port-forward}"
@@ -15,6 +15,7 @@ ACCESS_FILE="${ACCESS_FILE:-$STATE_DIR/access.conf}"
 BACKUP_DIR="${BACKUP_DIR:-$STATE_DIR/backups}"
 ACCESS_HISTORY_FILE="${ACCESS_HISTORY_FILE:-$STATE_DIR/access-history.log}"
 SHORTCUT_PATH="${SHORTCUT_PATH:-/usr/local/bin/nftpf}"
+LEGACY_SHORTCUT_PATH="${LEGACY_SHORTCUT_PATH:-/usr/bin/nft-helper}"
 CRON_FILE="${CRON_FILE:-/etc/cron.d/nft-port-forward-ddns}"
 DDNS_SERVICE_FILE="${DDNS_SERVICE_FILE:-/etc/systemd/system/nftpf-ddns.service}"
 DDNS_TIMER_FILE="${DDNS_TIMER_FILE:-/etc/systemd/system/nftpf-ddns.timer}"
@@ -2833,6 +2834,223 @@ clear_config() {
     pause_and_return
 }
 
+is_nftpf_managed_config() {
+    [ -f "$CONFIG_FILE" ] || return 1
+    grep -q "NFTPF_RENDER_VERSION=" "$CONFIG_FILE" && return 0
+    grep -q "IPV4_MARKER_START" "$CONFIG_FILE" && return 0
+    grep -q "IPV6_MARKER_START" "$CONFIG_FILE" && return 0
+    grep -q "MARKER_START" "$CONFIG_FILE" && return 0
+    return 1
+}
+
+write_empty_uninstall_config() {
+    local tmp_config
+
+    tmp_config=$(mktemp) || return 1
+    cat > "$tmp_config" <<EOF
+#!/usr/sbin/nft -f
+
+flush ruleset
+EOF
+
+    if find_nft_cmd && ! nft_run -c -f "$tmp_config"; then
+        rm -f "$tmp_config"
+        echo -e "${RED}错误：卸载用空配置校验失败，已跳过覆盖 $CONFIG_FILE。${PLAIN}"
+        return 1
+    fi
+
+    mv "$tmp_config" "$CONFIG_FILE"
+    chmod +x "$CONFIG_FILE" 2>/dev/null || true
+}
+
+cleanup_nftpf_units() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now nftpf-ddns.timer >/dev/null 2>&1 || true
+        systemctl disable --now nftpf-ddns.service >/dev/null 2>&1 || true
+        systemctl disable --now nftpf-route.service >/dev/null 2>&1 || true
+    fi
+
+    rm -f -- "$CRON_FILE" "$DDNS_SERVICE_FILE" "$DDNS_TIMER_FILE" "$ROUTE_SERVICE_FILE"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed nftpf-ddns.service nftpf-ddns.timer nftpf-route.service 2>/dev/null || true
+    fi
+}
+
+cleanup_managed_policy_routes() {
+    local line
+    local priority
+
+    command -v ip >/dev/null 2>&1 || return 0
+
+    if [ -f "$LINES_FILE" ]; then
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            read_line_fields "$line"
+            [[ "$L_MODE" == "managed" ]] || continue
+            priority=$((10100 + L_ID))
+
+            if [[ -n "$L_MARK" && -n "$L_TABLE4" ]]; then
+                ip -4 rule del fwmark "$L_MARK" table "$L_TABLE4" priority "$priority" 2>/dev/null || true
+                ip -4 route flush table "$L_TABLE4" 2>/dev/null || true
+            fi
+            if [[ -n "$L_MARK" && -n "$L_TABLE6" ]]; then
+                ip -6 rule del fwmark "$L_MARK" table "$L_TABLE6" priority "$priority" 2>/dev/null || true
+                ip -6 route flush table "$L_TABLE6" 2>/dev/null || true
+            fi
+        done < "$LINES_FILE"
+    fi
+
+    ip -6 rule del fwmark "$IPV6_ROUTE_MARK" table "$IPV6_ROUTE_TABLE" pref "$IPV6_ROUTE_MARK" 2>/dev/null || true
+}
+
+cleanup_routefix_persistence() {
+    local config_file="/etc/network/interfaces.d/50-cloud-init"
+
+    [[ "${NFT_HELPER_TEST_MODE:-0}" == "1" ]] && return 0
+    [ -f "$config_file" ] || return 0
+    grep -q "nftpf IPv6 DNAT route fix" "$config_file" || return 0
+
+    sed -i '/^[[:space:]]*# nftpf IPv6 DNAT route fix$/,+2d' "$config_file"
+}
+
+clear_nftables_for_uninstall() {
+    if find_nft_cmd; then
+        nft_run flush ruleset >/dev/null 2>&1 || echo -e "${YELLOW}警告：执行 nft flush ruleset 失败，请手动检查 nftables。${PLAIN}"
+    else
+        echo -e "${YELLOW}警告：未找到 nft 命令，无法立即 flush 当前 ruleset。${PLAIN}"
+    fi
+
+    if is_nftpf_managed_config || [ ! -f "$CONFIG_FILE" ]; then
+        write_empty_uninstall_config || true
+    else
+        echo -e "${YELLOW}警告：$CONFIG_FILE 不是 nftpf 托管格式，已跳过覆盖该配置文件。${PLAIN}"
+    fi
+}
+
+cleanup_state_files_for_uninstall() {
+    local delete_backups=$1
+
+    rm -f -- "$RULES_FILE" "$LINES_FILE" "$ACCESS_FILE" "$ACCESS_HISTORY_FILE"
+
+    if [[ "$delete_backups" == "1" ]]; then
+        rm -rf -- "$BACKUP_DIR"
+    fi
+
+    rmdir "$STATE_DIR" 2>/dev/null || true
+}
+
+cleanup_backup_files_for_uninstall() {
+    local current_script=$1
+    local files=()
+
+    shopt -s nullglob
+    files=(
+        "$CONFIG_FILE".bak
+        "$CONFIG_FILE".bak.*
+        "$CONFIG_FILE".bak.last
+        "$SHORTCUT_PATH".bak.*
+        "$LEGACY_SHORTCUT_PATH".bak.*
+        "$current_script".bak.*
+    )
+    shopt -u nullglob
+
+    if [ "${#files[@]}" -gt 0 ]; then
+        rm -f -- "${files[@]}"
+    fi
+}
+
+script_file_looks_like_nftpf() {
+    local path=$1
+
+    [ -f "$path" ] || return 1
+    grep -Eq 'NFTPF_VERSION|NFT Port Forwarding Tool|nftpf|nft-helper|Caesar|Nft 端口转发' "$path" 2>/dev/null
+}
+
+remove_installed_scripts_for_uninstall() {
+    local current_script=$1
+    local path
+    local resolved
+    local remove_path
+    local remove_key
+    local removed=""
+
+    for path in "$SHORTCUT_PATH" "$LEGACY_SHORTCUT_PATH" "$current_script"; do
+        [[ -n "$path" && -e "$path" ]] || continue
+        resolved=$(realpath "$path" 2>/dev/null || echo "$path")
+        for remove_path in "$path" "$resolved"; do
+            [[ -n "$remove_path" && -e "$remove_path" ]] || continue
+            remove_key=$(realpath "$remove_path" 2>/dev/null || echo "$remove_path")
+            case " $removed " in
+                *" $remove_key "*) continue ;;
+            esac
+
+            if script_file_looks_like_nftpf "$remove_path"; then
+                rm -f -- "$remove_path" 2>/dev/null || echo -e "${YELLOW}警告：删除脚本文件失败: $remove_path${PLAIN}"
+                removed="$removed $remove_key"
+            else
+                echo -e "${YELLOW}警告：跳过删除非 nftpf 脚本文件: $remove_path${PLAIN}"
+            fi
+        done
+    done
+}
+
+uninstall_script() {
+    local delete_backups_choice
+    local delete_backups=0
+    local confirm
+    local current_script
+
+    current_script="${NFTPF_UNINSTALL_CURRENT_SCRIPT:-$(realpath "$0" 2>/dev/null || echo "$0")}"
+
+    clear
+    echo -e "${RED}=== 卸载 nftpf ===${PLAIN}"
+    echo "将执行以下清理："
+    echo "1. 清空当前 nftables ruleset，并将 nftpf 托管配置重置为空规则。"
+    echo "2. 删除 DDNS 自动刷新 timer/service、旧 cron 任务。"
+    echo "3. 删除多网卡托管回程 route service，并清理 nftpf 创建的 fwmark/ip rule/路由表。"
+    echo "4. 删除规则库、线路库、访问控制配置和访问记录。"
+    echo "5. 删除快捷命令 $SHORTCUT_PATH，以及当前脚本文件。"
+    echo "6. 可选删除备份文件（默认保留）。"
+    echo ""
+    echo -e "${YELLOW}不会删除 nftables 软件包，也不会关闭系统 IP 转发 sysctl。${PLAIN}"
+    echo -e "${YELLOW}如果 $CONFIG_FILE 不是 nftpf 托管格式，脚本不会覆盖该配置文件。${PLAIN}"
+    echo ""
+
+    read -p "是否删除备份文件？[y/N]: " delete_backups_choice
+    if [[ "$delete_backups_choice" == "y" || "$delete_backups_choice" == "Y" ]]; then
+        delete_backups=1
+    fi
+
+    read -p "确认卸载？[y/N]: " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}已取消卸载。${PLAIN}"
+        pause_and_return
+        return
+    fi
+
+    cleanup_nftpf_units
+    cleanup_managed_policy_routes
+    cleanup_routefix_persistence
+    clear_nftables_for_uninstall
+    cleanup_state_files_for_uninstall "$delete_backups"
+    if [[ "$delete_backups" == "1" ]]; then
+        cleanup_backup_files_for_uninstall "$current_script"
+    fi
+    remove_installed_scripts_for_uninstall "$current_script"
+
+    echo -e "${GREEN}nftpf 卸载完成。${PLAIN}"
+    if [[ "$delete_backups" == "1" ]]; then
+        echo -e "${GREEN}备份文件已删除。${PLAIN}"
+    else
+        echo -e "${YELLOW}备份文件已保留在 $BACKUP_DIR。${PLAIN}"
+    fi
+    echo -e "${YELLOW}按下任意键退出...${PLAIN}"
+    read -n 1 -s -r
+    exit 0
+}
+
 # -----------------------------------------------------------------------------
 # Access control and observation workflows
 # -----------------------------------------------------------------------------
@@ -3536,6 +3754,7 @@ main_menu() {
     echo -e "15. 关闭 DDNS 自动刷新"
     echo -e "16. 线路管理（多网卡/多 DIA）"
     echo -e "17. 更新脚本"
+    echo -e "18. 卸载脚本"
     echo -e " 0. 退出脚本"
     echo -e "################################################"
     read -p "请输入数字: " choice
@@ -3558,6 +3777,7 @@ main_menu() {
         15) disable_ddns_auto_refresh ;;
         16) line_management_menu ;;
         17) update_script ;;
+        18) uninstall_script ;;
         0) echo -e "${GREEN}谢谢使用。${PLAIN}"; exit 0 ;;
         *) echo -e "${RED}请输入正确的数字。${PLAIN}"; sleep 1; main_menu ;;
     esac
@@ -3583,6 +3803,10 @@ run_cli() {
             update_script
             exit $?
             ;;
+        --uninstall)
+            uninstall_script
+            exit $?
+            ;;
         --version)
             echo "$NFTPF_VERSION"
             exit 0
@@ -3594,6 +3818,7 @@ run_cli() {
             echo "  nftpf --refresh-ddns   Refresh DDNS/domain forwarding targets"
             echo "  nftpf --apply-routes   Apply managed multi-NIC policy routes"
             echo "  nftpf --update         Download and install latest nftpf script"
+            echo "  nftpf --uninstall      Uninstall nftpf and clean managed state"
             echo "  nftpf --version        Show current nftpf version"
             echo "  nftpf --tool-help      Show this help"
             exit 0
@@ -3605,6 +3830,7 @@ run_cli() {
             echo "  nftpf --refresh-ddns   Refresh DDNS/domain forwarding targets"
             echo "  nftpf --apply-routes   Apply managed multi-NIC policy routes"
             echo "  nftpf --update         Download and install latest nftpf script"
+            echo "  nftpf --uninstall      Uninstall nftpf and clean managed state"
             echo "  nftpf --version        Show current nftpf version"
             echo "  nftpf --tool-help      Show this help"
             exit 0
