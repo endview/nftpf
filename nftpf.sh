@@ -5,7 +5,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-NFTPF_VERSION="${NFTPF_VERSION:-0.1.3}"
+NFTPF_VERSION="${NFTPF_VERSION:-0.2.0}"
 UPDATE_URL="${UPDATE_URL:-https://github.com/endview/nftpf/releases/latest/download/nftpf.sh}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/nftables.conf}"
 STATE_DIR="${STATE_DIR:-/etc/nft-port-forward}"
@@ -24,15 +24,16 @@ SERVICE_NAME="nftables"
 REAL_NFT_CMD="${REAL_NFT_CMD:-}"
 APPLY_RESULT=""
 CONFIG_AUTO_REBUILT=0
-CONFIG_RENDER_VERSION="3"
+CONFIG_RENDER_VERSION="4"
 TRACK_TIMEOUT="${TRACK_TIMEOUT:-30m}"
 IPV6_ROUTE_MARK="${IPV6_ROUTE_MARK:-100}"
 IPV6_ROUTE_TABLE="${IPV6_ROUTE_TABLE:-100}"
 NFTPF_IPV6_ROUTEFIX="${NFTPF_IPV6_ROUTEFIX:-auto}"
+MIGRATE_LEGACY_NAT=0
 
 if [[ "${NFT_HELPER_SKIP_ROOT:-0}" != "1" && $EUID -ne 0 ]]; then
     case "${1:-}" in
-        --help|-h|--tool-help|--version) ;;
+        --help|-h|--tool-help|--version|--self-test) ;;
         *)
             echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${PLAIN}"
             exit 1
@@ -85,6 +86,81 @@ nft_run() {
     fi
 
     "$REAL_NFT_CMD" "$@"
+}
+
+managed_table_specs() {
+    cat <<'EOF'
+ip nftpf_track
+ip6 nftpf_track
+ip nftpf_access
+ip6 nftpf_access
+inet nftpf_route
+ip6 nftpf_routefix
+ip nftpf_nat
+ip6 nftpf_nat
+EOF
+}
+
+append_managed_cleanup_commands() {
+    local output=$1
+    local family
+    local table
+
+    while read -r family table; do
+        if nft_run list table "$family" "$table" >/dev/null 2>&1; then
+            printf 'delete table %s %s\n' "$family" "$table" >> "$output"
+        fi
+    done < <(managed_table_specs)
+
+    if [[ "$MIGRATE_LEGACY_NAT" == "1" ]]; then
+        for family in ip ip6; do
+            for table in prerouting postrouting; do
+                if nft_run list chain "$family" nat "$table" >/dev/null 2>&1; then
+                    printf 'flush chain %s nat %s\n' "$family" "$table" >> "$output"
+                    printf 'delete chain %s nat %s\n' "$family" "$table" >> "$output"
+                fi
+            done
+        done
+    fi
+}
+
+build_apply_transaction() {
+    local config_file=$1
+    local output=$2
+
+    : > "$output" || return 1
+    echo '#!/usr/sbin/nft -f' >> "$output" || return 1
+    append_managed_cleanup_commands "$output" || return 1
+    sed '/^#!\/usr\/sbin\/nft -f$/d' "$config_file" >> "$output"
+}
+
+build_cleanup_transaction() {
+    local output=$1
+
+    : > "$output" || return 1
+    echo '#!/usr/sbin/nft -f' >> "$output" || return 1
+    append_managed_cleanup_commands "$output"
+}
+
+managed_rules_are_loaded() {
+    nft_run list table ip nftpf_nat >/dev/null 2>&1 ||
+        nft_run list table ip6 nftpf_nat >/dev/null 2>&1 ||
+        { [[ "$MIGRATE_LEGACY_NAT" == "1" ]] && nft_run list chain ip nat prerouting >/dev/null 2>&1; }
+}
+
+unload_managed_rules() {
+    local transaction
+
+    transaction=$(mktemp) || return 1
+    if ! build_cleanup_transaction "$transaction"; then
+        rm -f "$transaction"
+        return 1
+    fi
+    if ! nft_run -c -f "$transaction" || ! nft_run -f "$transaction"; then
+        rm -f "$transaction"
+        return 1
+    fi
+    rm -f "$transaction"
 }
 
 pause_and_return() {
@@ -176,18 +252,25 @@ create_state_backup() {
 ensure_sysctl_setting() {
     local key=$1
     local value=$2
+    local key_pattern
+    local matching_lines
+    local desired_lines
 
     if [ ! -f /etc/sysctl.conf ]; then
         touch /etc/sysctl.conf
     fi
 
-    if ! grep -q "^$key=$value$" /etc/sysctl.conf; then
-        sed -i "/^$key=/d" /etc/sysctl.conf
-        echo "$key=$value" >> /etc/sysctl.conf
-        return 0
+    key_pattern=${key//./\.}
+    matching_lines=$(grep -Ec "^[[:space:]]*$key_pattern[[:space:]]*=" /etc/sysctl.conf 2>/dev/null || true)
+    desired_lines=$(grep -Ec "^[[:space:]]*$key_pattern[[:space:]]*=[[:space:]]*$value([[:space:]]*(#.*)?)?$" /etc/sysctl.conf 2>/dev/null || true)
+
+    if [ "$matching_lines" -eq 1 ] && [ "$desired_lines" -eq 1 ]; then
+        return 1
     fi
 
-    return 1
+    sed -i "/^[[:space:]]*$key_pattern[[:space:]]*=/d" /etc/sysctl.conf
+    printf '%s=%s\n' "$key" "$value" >> /etc/sysctl.conf
+    return 0
 }
 
 enable_ip_forward() {
@@ -287,7 +370,6 @@ check_dependencies() {
             fi
             apt-get update
             apt-get install -y nftables
-            systemctl enable nftables
         fi
         find_nft_cmd || return 1
     fi
@@ -302,6 +384,10 @@ check_dependencies() {
         if apply_config_changes; then
             show_apply_result
         else
+            if [ -f "${CONFIG_FILE}.bak.last" ]; then
+                cp "${CONFIG_FILE}.bak.last" "$CONFIG_FILE"
+                echo -e "${YELLOW}自动升级应用失败，已恢复升级前配置文件。${PLAIN}"
+            fi
             return 1
         fi
     fi
@@ -1171,11 +1257,11 @@ import_existing_rules_from_config() {
     id=1
 
     while IFS= read -r line; do
-        if echo "$line" | grep -q '^table ip nat {'; then
+        if echo "$line" | grep -Eq '^table ip (nftpf_)?nat {'; then
             family="ipv4"
             continue
         fi
-        if echo "$line" | grep -q '^table ip6 nat {'; then
+        if echo "$line" | grep -Eq '^table ip6 (nftpf_)?nat {'; then
             family="ipv6"
             continue
         fi
@@ -1529,14 +1615,12 @@ cat <<EOF
 #!/usr/sbin/nft -f
 # NFTPF_RENDER_VERSION=$CONFIG_RENDER_VERSION
 
-flush ruleset
-
 EOF
     render_tracking_tables "$rules_file"
     render_access_tables "$rules_file"
     render_route_mark_table "$rules_file"
     cat <<EOF
-table ip nat {
+table ip nftpf_nat {
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
         # IPV4_MARKER_START
@@ -1552,7 +1636,7 @@ EOF
     }
 }
 
-table ip6 nat {
+table ip6 nftpf_nat {
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
         # IPV6_MARKER_START
@@ -1583,22 +1667,52 @@ EOF
 write_config_from_rules() {
     local rules_file=$1
     local tmp_config
+    local transaction
+    local had_config=0
 
     tmp_config=$(mktemp) || return 1
-    generate_config_from_rules "$rules_file" > "$tmp_config"
-
-    if ! nft_run -c -f "$tmp_config"; then
-        rm -f "$tmp_config"
-        echo -e "${RED}错误：生成的 nftables 配置校验失败，未覆盖当前配置。${PLAIN}"
+    transaction=$(mktemp) || { rm -f "$tmp_config"; return 1; }
+    if ! generate_config_from_rules "$rules_file" > "$tmp_config"; then
+        rm -f "$tmp_config" "$transaction"
+        echo -e "${RED}错误：无法生成 nftables 配置。${PLAIN}"
+        return 1
+    fi
+    if ! build_apply_transaction "$tmp_config" "$transaction"; then
+        rm -f "$tmp_config" "$transaction"
+        echo -e "${RED}错误：无法构建 nftables 应用事务。${PLAIN}"
         return 1
     fi
 
+    if ! nft_run -c -f "$transaction"; then
+        rm -f "$tmp_config" "$transaction"
+        echo -e "${RED}错误：生成的 nftables 配置校验失败，未覆盖当前配置。${PLAIN}"
+        return 1
+    fi
+    rm -f "$transaction"
+
     if [ -f "$CONFIG_FILE" ]; then
-        cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.last"
+        had_config=1
+        if ! cp "$CONFIG_FILE" "${CONFIG_FILE}.bak.last"; then
+            rm -f "$tmp_config"
+            echo -e "${RED}错误：无法备份当前 nftables 配置，已取消覆盖。${PLAIN}"
+            return 1
+        fi
     fi
 
-    mv "$tmp_config" "$CONFIG_FILE"
-    chmod +x "$CONFIG_FILE"
+    if ! mv "$tmp_config" "$CONFIG_FILE"; then
+        rm -f "$tmp_config"
+        echo -e "${RED}错误：无法写入 nftables 配置。${PLAIN}"
+        return 1
+    fi
+    if ! chmod +x "$CONFIG_FILE"; then
+        if [ "$had_config" -eq 1 ]; then
+            cp "${CONFIG_FILE}.bak.last" "$CONFIG_FILE" 2>/dev/null || true
+        else
+            rm -f "$CONFIG_FILE"
+        fi
+        echo -e "${RED}错误：无法设置 nftables 配置权限。${PLAIN}"
+        return 1
+    fi
 }
 
 init_config() {
@@ -1607,6 +1721,9 @@ init_config() {
     local access_mode
 
     ensure_state_dir
+    if [ -f "$CONFIG_FILE" ] && grep -Eq 'NFTPF_RENDER_VERSION=([123])([^0-9]|$)' "$CONFIG_FILE"; then
+        MIGRATE_LEGACY_NAT=1
+    fi
     import_existing_rules_from_config
 
     if [ ! -f "$CONFIG_FILE" ]; then
@@ -1619,6 +1736,8 @@ init_config() {
     access_mode=$(get_access_mode)
 
     ! grep -q "NFTPF_RENDER_VERSION=$CONFIG_RENDER_VERSION" "$CONFIG_FILE" && needs_rebuild=1
+    ! grep -q "table ip nftpf_nat" "$CONFIG_FILE" && needs_rebuild=1
+    ! grep -q "table ip6 nftpf_nat" "$CONFIG_FILE" && needs_rebuild=1
     ! grep -q "IPV4_MARKER_START" "$CONFIG_FILE" && needs_rebuild=1
     ! grep -q "IPV6_MARKER_START" "$CONFIG_FILE" && needs_rebuild=1
     ! grep -q "ct status dnat masquerade" "$CONFIG_FILE" && needs_rebuild=1
@@ -1638,17 +1757,34 @@ init_config() {
 }
 
 validate_nft_config() {
-    nft_run -c -f "$CONFIG_FILE"
-}
+    local transaction
+    local rc
 
-service_is_running() {
-    systemctl is-active --quiet "$SERVICE_NAME"
+    transaction=$(mktemp) || return 1
+    if ! build_apply_transaction "$CONFIG_FILE" "$transaction"; then
+        rm -f "$transaction"
+        return 1
+    fi
+    nft_run -c -f "$transaction"
+    rc=$?
+    rm -f "$transaction"
+    return "$rc"
 }
 
 apply_config_changes() {
+    local transaction
+    local service_was_enabled=0
     APPLY_RESULT=""
 
-    if ! validate_nft_config; then
+    transaction=$(mktemp) || return 1
+    if ! build_apply_transaction "$CONFIG_FILE" "$transaction"; then
+        rm -f "$transaction"
+        echo -e "${RED}错误：无法构建 nftables 应用事务，未应用。${PLAIN}"
+        return 1
+    fi
+
+    if ! nft_run -c -f "$transaction"; then
+        rm -f "$transaction"
         echo -e "${RED}错误：当前 nftables 配置校验失败，未应用。${PLAIN}"
         return 1
     fi
@@ -1657,53 +1793,96 @@ apply_config_changes() {
     ensure_ipv6_dnat_policy_route
 
     if [[ "${NFT_HELPER_TEST_MODE:-0}" == "1" ]]; then
+        rm -f "$transaction"
         APPLY_RESULT="tested"
         return 0
     fi
 
-    if service_is_running; then
-        if systemctl restart "$SERVICE_NAME"; then
-            APPLY_RESULT="restarted"
-            return 0
-        fi
-    else
-        if systemctl start "$SERVICE_NAME"; then
-            APPLY_RESULT="started"
-            return 0
-        fi
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        service_was_enabled=1
     fi
 
-    systemctl status "$SERVICE_NAME" --no-pager -l 2>/dev/null || true
-    echo -e "${RED}错误：服务启动或重启失败，请查看上方错误信息。${PLAIN}"
+    if ! systemctl enable "$SERVICE_NAME" >/dev/null 2>&1; then
+        rm -f "$transaction"
+        if [ "$service_was_enabled" -eq 0 ]; then
+            systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        fi
+        echo -e "${RED}错误：无法启用 $SERVICE_NAME 开机自启，配置未应用。${PLAIN}"
+        return 1
+    fi
+
+    if nft_run -f "$transaction"; then
+        rm -f "$transaction"
+        APPLY_RESULT="applied_enabled"
+        return 0
+    fi
+
+    rm -f "$transaction"
+    if [ "$service_was_enabled" -eq 0 ]; then
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+    echo -e "${RED}错误：原子应用 nftpf 规则失败，实时 ruleset 保持原状。${PLAIN}"
     return 1
 }
 
 show_apply_result() {
     case "$APPLY_RESULT" in
         tested) echo -e "${GREEN}配置已通过校验（测试模式未操作服务）。${PLAIN}" ;;
-        started) echo -e "${GREEN}配置已校验通过并自动应用，服务已启动。${PLAIN}" ;;
-        restarted) echo -e "${GREEN}配置已校验通过并自动应用，服务已重启。${PLAIN}" ;;
+        applied_enabled) echo -e "${GREEN}配置已原子应用，并已启用 nftables 开机自启。${PLAIN}" ;;
         *) echo -e "${GREEN}配置已应用。${PLAIN}" ;;
     esac
 }
 
 commit_rules_file() {
     local tmp_rules=$1
+    local rollback_dir
+    local had_rules=0
+    local had_config=0
 
     create_state_backup "before-rules-change" 1
+    rollback_dir=$(mktemp -d) || { rm -f "$tmp_rules"; return 1; }
+    if [ -f "$RULES_FILE" ]; then
+        if ! cp "$RULES_FILE" "$rollback_dir/rules.db"; then
+            rm -f "$tmp_rules"
+            rm -rf "$rollback_dir"
+            echo -e "${RED}错误：无法创建规则回滚快照，已取消修改。${PLAIN}"
+            return 1
+        fi
+        had_rules=1
+    fi
+    if [ -f "$CONFIG_FILE" ]; then
+        if ! cp "$CONFIG_FILE" "$rollback_dir/nftables.conf"; then
+            rm -f "$tmp_rules"
+            rm -rf "$rollback_dir"
+            echo -e "${RED}错误：无法创建配置回滚快照，已取消修改。${PLAIN}"
+            return 1
+        fi
+        had_config=1
+    fi
 
     if ! write_config_from_rules "$tmp_rules"; then
         rm -f "$tmp_rules"
+        rm -rf "$rollback_dir"
         return 1
     fi
 
-    mv "$tmp_rules" "$RULES_FILE"
+    if ! mv "$tmp_rules" "$RULES_FILE"; then
+        if [ "$had_config" -eq 1 ]; then cp "$rollback_dir/nftables.conf" "$CONFIG_FILE"; else rm -f "$CONFIG_FILE"; fi
+        rm -f "$tmp_rules"
+        rm -rf "$rollback_dir"
+        echo -e "${RED}错误：无法更新规则库，配置文件已回滚。${PLAIN}"
+        return 1
+    fi
 
     if apply_config_changes; then
+        rm -rf "$rollback_dir"
         show_apply_result
         return 0
     else
-        echo -e "${YELLOW}规则已保存，但服务未成功应用；修复问题后可使用“重启服务”。${PLAIN}"
+        if [ "$had_rules" -eq 1 ]; then cp "$rollback_dir/rules.db" "$RULES_FILE"; else rm -f "$RULES_FILE"; fi
+        if [ "$had_config" -eq 1 ]; then cp "$rollback_dir/nftables.conf" "$CONFIG_FILE"; else rm -f "$CONFIG_FILE"; fi
+        rm -rf "$rollback_dir"
+        echo -e "${YELLOW}规则应用失败，规则库和配置文件已自动回滚；实时 ruleset 保持原状。${PLAIN}"
         return 1
     fi
 }
@@ -2251,19 +2430,53 @@ line_in_use() {
 
 commit_lines_file() {
     local tmp_lines=$1
+    local rollback_dir
+    local had_lines=0
+    local had_config=0
 
     create_state_backup "before-line-change" 1
+    rollback_dir=$(mktemp -d) || { rm -f "$tmp_lines"; return 1; }
+    if [ -f "$LINES_FILE" ]; then
+        if ! cp "$LINES_FILE" "$rollback_dir/lines.db"; then
+            rm -f "$tmp_lines"
+            rm -rf "$rollback_dir"
+            echo -e "${RED}错误：无法创建线路回滚快照，已取消修改。${PLAIN}"
+            return 1
+        fi
+        had_lines=1
+    fi
+    if [ -f "$CONFIG_FILE" ]; then
+        if ! cp "$CONFIG_FILE" "$rollback_dir/nftables.conf"; then
+            rm -f "$tmp_lines"
+            rm -rf "$rollback_dir"
+            echo -e "${RED}错误：无法创建配置回滚快照，已取消修改。${PLAIN}"
+            return 1
+        fi
+        had_config=1
+    fi
 
     if LINES_FILE="$tmp_lines" write_config_from_rules "$RULES_FILE"; then
-        mv "$tmp_lines" "$LINES_FILE"
+        if ! mv "$tmp_lines" "$LINES_FILE"; then
+            if [ "$had_config" -eq 1 ]; then cp "$rollback_dir/nftables.conf" "$CONFIG_FILE"; else rm -f "$CONFIG_FILE"; fi
+            rm -f "$tmp_lines"
+            rm -rf "$rollback_dir"
+            echo -e "${RED}错误：无法更新线路库，配置文件已回滚。${PLAIN}"
+            return 1
+        fi
         if apply_config_changes; then
+            rm -rf "$rollback_dir"
             show_apply_result
             return 0
         fi
+        if [ "$had_lines" -eq 1 ]; then cp "$rollback_dir/lines.db" "$LINES_FILE"; else rm -f "$LINES_FILE"; fi
+        if [ "$had_config" -eq 1 ]; then cp "$rollback_dir/nftables.conf" "$CONFIG_FILE"; else rm -f "$CONFIG_FILE"; fi
+        rm -rf "$rollback_dir"
+        echo -e "${YELLOW}线路应用失败，线路库和配置文件已自动回滚。${PLAIN}"
         return 1
     fi
 
     rm -f "$tmp_lines"
+    rm -rf "$rollback_dir"
     return 1
 }
 
@@ -2795,20 +3008,17 @@ manage_service() {
     local action=$1
 
     case "$action" in
-        enable) systemctl enable "$SERVICE_NAME" && echo -e "${GREEN}已设置开机自启。${PLAIN}" ;;
-        disable) systemctl disable "$SERVICE_NAME" && echo -e "${GREEN}已取消开机自启。${PLAIN}" ;;
-        start)
-            if validate_nft_config && systemctl start "$SERVICE_NAME"; then
-                echo -e "${GREEN}服务已启动。${PLAIN}"
-            else
-                systemctl status "$SERVICE_NAME" --no-pager -l 2>/dev/null || true
-                echo -e "${RED}服务启动失败。${PLAIN}"
-            fi
-            ;;
-        stop) systemctl stop "$SERVICE_NAME" && echo -e "${GREEN}服务已停止。${PLAIN}" ;;
-        restart)
+        enable|start|restart)
             if apply_config_changes; then
                 show_apply_result
+            fi
+            ;;
+        disable) systemctl disable "$SERVICE_NAME" && echo -e "${GREEN}已取消开机自启。${PLAIN}" ;;
+        stop)
+            if unload_managed_rules; then
+                echo -e "${GREEN}已卸载 nftpf 实时规则；未停止全局 nftables 服务，其他工具规则保持不变。${PLAIN}"
+            else
+                echo -e "${RED}卸载 nftpf 实时规则失败。${PLAIN}"
             fi
             ;;
     esac
@@ -2849,8 +3059,6 @@ write_empty_uninstall_config() {
     tmp_config=$(mktemp) || return 1
     cat > "$tmp_config" <<EOF
 #!/usr/sbin/nft -f
-
-flush ruleset
 EOF
 
     if find_nft_cmd && ! nft_run -c -f "$tmp_config"; then
@@ -2916,10 +3124,14 @@ cleanup_routefix_persistence() {
 }
 
 clear_nftables_for_uninstall() {
+    if [ -f "$CONFIG_FILE" ] && grep -Eq 'NFTPF_RENDER_VERSION=([123])([^0-9]|$)' "$CONFIG_FILE"; then
+        MIGRATE_LEGACY_NAT=1
+    fi
+
     if find_nft_cmd; then
-        nft_run flush ruleset >/dev/null 2>&1 || echo -e "${YELLOW}警告：执行 nft flush ruleset 失败，请手动检查 nftables。${PLAIN}"
+        unload_managed_rules >/dev/null 2>&1 || echo -e "${YELLOW}警告：卸载 nftpf 托管表失败，请手动检查 nftables。${PLAIN}"
     else
-        echo -e "${YELLOW}警告：未找到 nft 命令，无法立即 flush 当前 ruleset。${PLAIN}"
+        echo -e "${YELLOW}警告：未找到 nft 命令，无法立即卸载 nftpf 托管表。${PLAIN}"
     fi
 
     if is_nftpf_managed_config || [ ! -f "$CONFIG_FILE" ]; then
@@ -3007,7 +3219,7 @@ uninstall_script() {
     clear
     echo -e "${RED}=== 卸载 nftpf ===${PLAIN}"
     echo "将执行以下清理："
-    echo "1. 清空当前 nftables ruleset，并将 nftpf 托管配置重置为空规则。"
+    echo "1. 仅卸载 nftpf 托管表，并将 nftpf 托管配置重置为空规则。"
     echo "2. 删除 DDNS 自动刷新 timer/service、旧 cron 任务。"
     echo "3. 删除多网卡托管回程 route service，并清理 nftpf 创建的 fwmark/ip rule/路由表。"
     echo "4. 删除规则库、线路库、访问控制配置和访问记录。"
@@ -3376,20 +3588,54 @@ confirm_whitelist_family_coverage() {
 
 commit_access_file() {
     local tmp_access=$1
+    local rollback_dir
+    local had_access=0
+    local had_config=0
 
     create_state_backup "before-access-change" 1
+    rollback_dir=$(mktemp -d) || { rm -f "$tmp_access"; return 1; }
+    if [ -f "$ACCESS_FILE" ]; then
+        if ! cp "$ACCESS_FILE" "$rollback_dir/access.conf"; then
+            rm -f "$tmp_access"
+            rm -rf "$rollback_dir"
+            echo -e "${RED}错误：无法创建访问控制回滚快照，已取消修改。${PLAIN}"
+            return 1
+        fi
+        had_access=1
+    fi
+    if [ -f "$CONFIG_FILE" ]; then
+        if ! cp "$CONFIG_FILE" "$rollback_dir/nftables.conf"; then
+            rm -f "$tmp_access"
+            rm -rf "$rollback_dir"
+            echo -e "${RED}错误：无法创建配置回滚快照，已取消修改。${PLAIN}"
+            return 1
+        fi
+        had_config=1
+    fi
 
     if ACCESS_FILE="$tmp_access" write_config_from_rules "$RULES_FILE"; then
         backup_file "$ACCESS_FILE"
-        mv "$tmp_access" "$ACCESS_FILE"
+        if ! mv "$tmp_access" "$ACCESS_FILE"; then
+            if [ "$had_config" -eq 1 ]; then cp "$rollback_dir/nftables.conf" "$CONFIG_FILE"; else rm -f "$CONFIG_FILE"; fi
+            rm -f "$tmp_access"
+            rm -rf "$rollback_dir"
+            echo -e "${RED}错误：无法更新访问控制文件，配置文件已回滚。${PLAIN}"
+            return 1
+        fi
         if apply_config_changes; then
+            rm -rf "$rollback_dir"
             show_apply_result
             return 0
         fi
+        if [ "$had_access" -eq 1 ]; then cp "$rollback_dir/access.conf" "$ACCESS_FILE"; else rm -f "$ACCESS_FILE"; fi
+        if [ "$had_config" -eq 1 ]; then cp "$rollback_dir/nftables.conf" "$CONFIG_FILE"; else rm -f "$CONFIG_FILE"; fi
+        rm -rf "$rollback_dir"
+        echo -e "${YELLOW}访问控制应用失败，访问控制文件和配置文件已自动回滚。${PLAIN}"
         return 1
     fi
 
     rm -f "$tmp_access"
+    rm -rf "$rollback_dir"
     return 1
 }
 
@@ -3529,6 +3775,12 @@ restore_backup_path() {
     local backup_path=$1
     local tmp_dir
     local tmp_access
+    local rollback_dir
+    local file
+    local had_file
+    local source
+    local target
+    local import_copy_ok=1
 
     if [ ! -f "$backup_path" ]; then
         echo -e "${RED}错误：备份文件不存在。${PLAIN}"
@@ -3564,24 +3816,62 @@ restore_backup_path() {
     fi
 
     create_state_backup "before-restore" 1
+    rollback_dir=$(mktemp -d) || { rm -rf "$tmp_dir"; return 1; }
+    for file in rules.db lines.db access.conf access-history.log nftables.conf; do
+        had_file=0
+        case "$file" in
+            rules.db) source=$RULES_FILE ;;
+            lines.db) source=$LINES_FILE ;;
+            access.conf) source=$ACCESS_FILE ;;
+            access-history.log) source=$ACCESS_HISTORY_FILE ;;
+            nftables.conf) source=$CONFIG_FILE ;;
+        esac
+        if [ -f "$source" ]; then
+            if ! cp "$source" "$rollback_dir/$file"; then
+                rm -rf "$tmp_dir" "$rollback_dir"
+                echo -e "${RED}错误：无法创建导入前回滚快照，已取消导入。${PLAIN}"
+                return 1
+            fi
+            had_file=1
+        fi
+        echo "$had_file" > "$rollback_dir/$file.present"
+    done
 
     if ACCESS_FILE="$tmp_dir/access.conf" LINES_FILE="$tmp_dir/lines.db" write_config_from_rules "$tmp_dir/rules.db"; then
-        cp "$tmp_dir/rules.db" "$RULES_FILE"
-        cp "$tmp_dir/lines.db" "$LINES_FILE"
-        cp "$tmp_dir/access.conf" "$ACCESS_FILE"
+        cp "$tmp_dir/rules.db" "$RULES_FILE" || import_copy_ok=0
+        cp "$tmp_dir/lines.db" "$LINES_FILE" || import_copy_ok=0
+        cp "$tmp_dir/access.conf" "$ACCESS_FILE" || import_copy_ok=0
         if [ -f "$tmp_dir/access-history.log" ]; then
-            cp "$tmp_dir/access-history.log" "$ACCESS_HISTORY_FILE"
-            chmod 600 "$ACCESS_HISTORY_FILE" 2>/dev/null || true
+            cp "$tmp_dir/access-history.log" "$ACCESS_HISTORY_FILE" || import_copy_ok=0
+            if [ "$import_copy_ok" -eq 1 ]; then
+                chmod 600 "$ACCESS_HISTORY_FILE" 2>/dev/null || true
+            fi
         fi
-        if apply_config_changes; then
+        if [ "$import_copy_ok" -eq 1 ] && apply_config_changes; then
             show_apply_result
             echo -e "${GREEN}备份已导入并应用: $backup_path${PLAIN}"
-            rm -rf "$tmp_dir"
+            rm -rf "$tmp_dir" "$rollback_dir"
             return 0
         fi
+        [ "$import_copy_ok" -eq 1 ] || echo -e "${RED}错误：备份状态文件写入不完整，未应用规则。${PLAIN}"
     fi
 
-    rm -rf "$tmp_dir"
+    for file in rules.db lines.db access.conf access-history.log nftables.conf; do
+        case "$file" in
+            rules.db) target=$RULES_FILE ;;
+            lines.db) target=$LINES_FILE ;;
+            access.conf) target=$ACCESS_FILE ;;
+            access-history.log) target=$ACCESS_HISTORY_FILE ;;
+            nftables.conf) target=$CONFIG_FILE ;;
+        esac
+        if [ "$(cat "$rollback_dir/$file.present")" = "1" ]; then
+            cp "$rollback_dir/$file" "$target"
+        else
+            rm -f "$target"
+        fi
+    done
+    rm -rf "$tmp_dir" "$rollback_dir"
+    echo -e "${YELLOW}备份导入失败，规则库、访问控制、线路和配置文件已自动回滚。${PLAIN}"
     return 1
 }
 
@@ -3660,6 +3950,55 @@ backup_restore_menu() {
     esac
 }
 
+self_test() {
+    local tmp_dir
+    local tmp_rules
+    local tmp_config
+    local saved_rules_file=$RULES_FILE
+    local saved_lines_file=$LINES_FILE
+    local saved_access_file=$ACCESS_FILE
+    local saved_state_dir=$STATE_DIR
+
+    tmp_dir=$(mktemp -d) || return 1
+    tmp_rules="$tmp_dir/rules.db"
+    tmp_config="$tmp_dir/nftables.conf"
+    STATE_DIR="$tmp_dir/state"
+    RULES_FILE="$tmp_rules"
+    LINES_FILE="$tmp_dir/lines.db"
+    ACCESS_FILE="$tmp_dir/access.conf"
+    mkdir -p "$STATE_DIR"
+    : > "$RULES_FILE"
+    : > "$LINES_FILE"
+    echo 'mode=off' > "$ACCESS_FILE"
+
+    if ! bash -n "${BASH_SOURCE[0]}"; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    generate_config_from_rules "$RULES_FILE" > "$tmp_config"
+    grep -q '^# NFTPF_RENDER_VERSION=4$' "$tmp_config" || { echo 'self-test: render version mismatch' >&2; rm -rf "$tmp_dir"; return 1; }
+    grep -q '^table ip nftpf_nat {' "$tmp_config" || { echo 'self-test: IPv4 managed NAT table missing' >&2; rm -rf "$tmp_dir"; return 1; }
+    grep -q '^table ip6 nftpf_nat {' "$tmp_config" || { echo 'self-test: IPv6 managed NAT table missing' >&2; rm -rf "$tmp_dir"; return 1; }
+    if grep -q '^flush ruleset$' "$tmp_config"; then
+        echo 'self-test: generated config must not flush the global ruleset' >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if build_apply_transaction "$tmp_dir/missing.conf" "$tmp_dir/missing-transaction.nft" 2>/dev/null; then
+        echo 'self-test: transaction build must fail when its config input is missing' >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    RULES_FILE=$saved_rules_file
+    LINES_FILE=$saved_lines_file
+    ACCESS_FILE=$saved_access_file
+    STATE_DIR=$saved_state_dir
+    rm -rf "$tmp_dir"
+    echo "[OK] nftpf self-test passed."
+}
+
 # -----------------------------------------------------------------------------
 # Status and interactive menu
 # -----------------------------------------------------------------------------
@@ -3677,8 +4016,11 @@ get_status() {
         INSTALL_STATUS="${RED}未安装${PLAIN}"
     fi
 
-    RUN_STATUS="${RED}未运行${PLAIN}"
-    command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE_NAME" && RUN_STATUS="${GREEN}运行中${PLAIN}"
+    RUN_STATUS="${RED}未加载${PLAIN}"
+    find_nft_cmd && managed_rules_are_loaded && RUN_STATUS="${GREEN}已加载${PLAIN}"
+
+    BOOT_STATUS="${RED}未启用${PLAIN}"
+    command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet "$SERVICE_NAME" && BOOT_STATUS="${GREEN}已启用${PLAIN}"
 
     local ip4
     local ip6
@@ -3726,12 +4068,13 @@ main_menu() {
     echo -e "#            NFT端口转发简易化工具             #"
     echo -e "################################################"
     echo -e "Nftables 状态: ${INSTALL_STATUS}"
-    echo -e "服务运行 状态: ${RUN_STATUS}"
+    echo -e "实时规则 状态: ${RUN_STATUS}"
+    echo -e "开机自启 状态: ${BOOT_STATUS}"
     echo -e "IP转发   状态: ${FW_STATUS}"
     echo -e "访问控制 状态: ${ACCESS_STATUS}"
     echo -e "入口线路 状态: ${LINE_STATUS}"
     echo -e "${YELLOW}提示: 输入 nftpf 可快速启动本脚本${PLAIN}"
-    echo -e "${YELLOW}注意: 本工具生成配置时包含 flush ruleset，会清空当前 nftables 规则集。${PLAIN}"
+    echo -e "${YELLOW}说明: 本工具仅替换 nftpf_* 托管表，不清除其他 nftables/iptables-nft 规则。${PLAIN}"
     echo -e "################################################"
     show_rules_overview
     echo -e "################################################"
@@ -3745,8 +4088,8 @@ main_menu() {
     echo -e " 7. 设置开机自启"
     echo -e " 8. 取消开机自启"
     echo -e " 9. 启动服务"
-    echo -e "10. 停止服务"
-    echo -e "11. 重启服务"
+    echo -e "10. 卸载本工具实时规则"
+    echo -e "11. 重新原子应用规则"
     echo -e "------------------------------------------------"
     echo -e "12. 访问控制（白名单/黑名单）"
     echo -e "13. 刷新 DDNS 规则"
@@ -3798,6 +4141,19 @@ run_cli() {
             apply_managed_routes
             exit $?
             ;;
+        --apply)
+            check_dependencies || exit 1
+            [ "$CONFIG_AUTO_REBUILT" -eq 1 ] && exit 0
+            if apply_config_changes; then
+                show_apply_result
+                exit 0
+            fi
+            exit 1
+            ;;
+        --self-test)
+            self_test
+            exit $?
+            ;;
         --update)
             NFTPF_CLI_MODE=1
             update_script
@@ -3817,6 +4173,8 @@ run_cli() {
             echo "  nftpf                  Open interactive forwarding menu"
             echo "  nftpf --refresh-ddns   Refresh DDNS/domain forwarding targets"
             echo "  nftpf --apply-routes   Apply managed multi-NIC policy routes"
+            echo "  nftpf --apply          Validate, atomically apply, and persist nftpf rules"
+            echo "  nftpf --self-test      Run local syntax and renderer checks"
             echo "  nftpf --update         Download and install latest nftpf script"
             echo "  nftpf --uninstall      Uninstall nftpf and clean managed state"
             echo "  nftpf --version        Show current nftpf version"
@@ -3829,6 +4187,8 @@ run_cli() {
             echo "  nftpf                  Open interactive forwarding menu"
             echo "  nftpf --refresh-ddns   Refresh DDNS/domain forwarding targets"
             echo "  nftpf --apply-routes   Apply managed multi-NIC policy routes"
+            echo "  nftpf --apply          Validate, atomically apply, and persist nftpf rules"
+            echo "  nftpf --self-test      Run local syntax and renderer checks"
             echo "  nftpf --update         Download and install latest nftpf script"
             echo "  nftpf --uninstall      Uninstall nftpf and clean managed state"
             echo "  nftpf --version        Show current nftpf version"

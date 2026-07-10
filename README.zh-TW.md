@@ -9,8 +9,10 @@
 - 新增單連接埠 TCP+UDP 轉發規則。
 - 新增連接埠區段轉發規則，支援 1:1 映射和偏移映射。
 - 支援 IPv4、IPv6、網域/DDNS 目標。
-- 寫入設定前自動校驗 nftables 語法。
-- 規則變更後自動啟動或重新啟動 nftables 服務，使設定立即生效。
+- 修改即時規則前驗證完整 nftables 交易。
+- 原子替換 `nftpf_*` 託管表，不重新啟動全域 nftables 服務。
+- 每次成功套用規則時啟用 nftables 開機自啟，並分別顯示即時規則與開機持久化狀態。
+- 可與 iptables-nft、Phantun、Docker、fail2ban 等工具管理的規則共存。
 - 啟動時自動偵測並修復本工具託管的 nftables 設定漂移。
 - 支援 DDNS 手動刷新和 systemd timer 自動刷新。
 - 支援白名單/黑名單二選一的存取控制，只限制本工具託管的轉發連接埠。
@@ -24,7 +26,10 @@
 ## 快速開始
 
 ```bash
-curl -L -o nftpf.sh https://github.com/endview/nftpf/releases/latest/download/nftpf.sh
+curl -fL --proto '=https' --tlsv1.2 -o nftpf.sh https://github.com/endview/nftpf/releases/latest/download/nftpf.sh
+curl -fL --proto '=https' --tlsv1.2 -o SHA256SUMS https://github.com/endview/nftpf/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS
+bash -n nftpf.sh
 chmod +x nftpf.sh
 sudo bash nftpf.sh
 ```
@@ -35,15 +40,13 @@ sudo bash nftpf.sh
 nftpf
 ```
 
-## 重要提示
+## 規則隔離與持久化
 
-本工具產生的 nftables 設定包含：
+從 v0.2.0 開始，產生的設定不再包含 `flush ruleset`。`nftpf` 只管理名稱以 `nftpf_` 開頭的表；套用前會驗證「刪除舊託管表並建立新託管表」的完整交易，驗證通過後一次原子提交，不會清除其它 nftables 或 iptables-nft 表。
 
-```nft
-flush ruleset
-```
+從 v0.1.x 升級時，一次性遷移只刪除 `nftpf` 舊版在 `table ip nat` / `table ip6 nat` 中建立的小寫 `prerouting`、`postrouting` 鏈；iptables-nft 使用的大寫 `PREROUTING`、`POSTROUTING` 等鏈會保留。
 
-這表示套用本工具託管設定時，會重寫目前 nftables 規則集。如果你的伺服器上還有 Docker、fail2ban、防火牆面板或其他程式也在管理 nftables，請先確認你能接受這個行為後再使用。
+每次成功套用都會啟用 `nftables.service` 開機自啟。可以執行 `nftpf --apply` 驗證、原子載入並持久化託管規則。如果主機同時執行其它防火牆管理程式，請避免手動重新啟動全域 nftables 服務，因為部分發行版的 service 在重新啟動時會清空整個即時 ruleset。
 
 ## DDNS 刷新
 
@@ -81,7 +84,26 @@ Unit=nftpf-ddns.service
 
 ## 備份和回滾
 
-每次修改轉發規則或存取控制設定前，`nftpf` 會自動在 `/etc/nft-port-forward/backups` 下建立備份。選單也提供手動備份、匯入備份，以及回滾到上一次自動備份。
+每次修改轉發規則或存取控制設定前，`nftpf` 會自動在 `/etc/nft-port-forward/backups` 下建立備份。選單也提供手動備份、匯入備份，以及回滾到上一次自動備份。套用失敗時會還原之前的狀態檔、產生設定和服務啟用狀態。
+
+可以執行 `nftpf --self-test` 做無侵入檢查；該命令驗證 Bash 語法和設定渲染約束，不修改系統規則。
+
+## 測試
+
+一般 Linux 主機可以執行快速檢查：
+
+```bash
+bash -n nftpf.sh
+bash nftpf.sh --self-test
+```
+
+整合測試需要 root，以及 `iproute2`、`iptables`、`nftables`。測試會建立隔離網路命名空間，模擬 v0.1.x 規則遷移，並驗證外部 iptables-nft 規則在遷移、重複套用、錯誤交易和清理後仍保持不變；不會修改宿主網路命名空間。
+
+```bash
+sudo bash tests/namespace-integration.sh ./nftpf.sh
+```
+
+GitHub Actions 會自動執行同一組檢查。
 
 ## 腳本更新
 
@@ -89,13 +111,17 @@ Unit=nftpf-ddns.service
 
 ## 卸載
 
-可以使用選單 `18. 卸載腳本`，也可以執行 `nftpf --uninstall`。卸載流程會清空目前 nftables ruleset，將 nftpf 託管設定重置為空規則，刪除 DDNS timer/service、舊 cron 任務、多網卡託管回程 service 和 nftpf 建立的 fwmark/ip rule/路由表，刪除狀態檔案，並刪除已安裝腳本和快捷命令。是否刪除備份檔案會單獨詢問，預設 `N` 保留。
+可以使用選單 `18. 卸載腳本`，也可以執行 `nftpf --uninstall`。卸載流程只刪除 nftpf 託管表，將 nftpf 託管設定重置為空檔案，刪除 DDNS timer/service、舊 cron 任務、多網卡託管回程 service 和 nftpf 建立的 fwmark/ip rule/路由表，刪除狀態檔案，並刪除已安裝腳本和快捷命令。是否刪除備份檔案會單獨詢問，預設 `N` 保留。
 
 卸載不會刪除 `nftables` 套件，也不會關閉系統 IP 轉發 sysctl，因為這些可能被其它服務使用。
 
 ## 檔案說明
 
 - `nftpf.sh`：主腳本。
+- `tests/namespace-integration.sh`：隔離的遷移與共存回歸測試。
+- `.github/workflows/ci.yml`：GitHub Actions 自動校驗流程。
+- `CHANGELOG.md`：按版本維護的變更記錄。
+- `SECURITY.md`：支援版本和私密漏洞回報說明。
 - `NFT_Port_Forwarding_Tool_PRD.md`：產品需求和設計說明。
 
 ## 環境需求
@@ -105,6 +131,7 @@ Unit=nftpf-ddns.service
 - `bash`。
 - `nftables`。
 - `iproute2`。
+- Debian/Ubuntu 可自動安裝 nftables；其它 systemd 發行版請先手動安裝。
 - 選用：`util-linux` 中的 `flock`，用於 DDNS 刷新防重疊執行。
 
 ## 授權
