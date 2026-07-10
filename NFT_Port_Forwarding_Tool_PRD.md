@@ -1,5 +1,7 @@
 # NFT Port Forwarding Tool PRD
 
+> Status: historical design document. It records the original implementation plan and v0.1.x baseline. See `README.md` and `CHANGELOG.md` for current v0.2.x behavior.
+
 ## 1. Document Info
 
 Product name: NFT Port Forwarding Tool
@@ -8,7 +10,7 @@ Document type: Product Requirements Document
 
 Target platform: Linux servers using nftables
 
-Primary script: `nft_helper.sh`
+Primary script: `nftpf.sh`
 
 Baseline version: Initial IPv4-only script from `C:/Users/endin/Downloads/nft_helper.sh`
 
@@ -101,7 +103,9 @@ Secondary users:
 
 9. As a user, I can enter a DDNS domain as the target address in a future version and have the tool keep it updated.
 
-## 8. Current Baseline Behavior
+## 8. Historical v0.1.x Baseline Behavior
+
+The global `flush ruleset` structure below is retained only as historical context. v0.2.0 and later use namespaced `nftpf_*` tables and atomically replace only those managed tables.
 
 The initial script uses this default nftables structure:
 

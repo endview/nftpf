@@ -9,8 +9,10 @@
 - Add single-port forwarding rules for TCP and UDP.
 - Add port-range forwarding rules with 1:1 or offset mapping.
 - Support IPv4, IPv6, and domain/DDNS targets.
-- Automatically validate nftables configuration before applying changes.
-- Automatically apply changes by starting or restarting the nftables service.
+- Validate the complete nftables transaction before changing live rules.
+- Atomically replace only `nftpf_*` tables without restarting the global nftables service.
+- Enable nftables at boot whenever rules are applied, while reporting live-rule and boot-persistence status separately.
+- Coexist with rules managed by iptables-nft, Phantun, Docker, fail2ban, and other tools.
 - Detect and repair managed nftables configuration drift on startup.
 - Support DDNS refresh with optional systemd timer automation.
 - Support mutually exclusive whitelist/blacklist access control for managed forwarding ports.
@@ -24,7 +26,10 @@
 ## Quick Start
 
 ```bash
-curl -L -o nftpf.sh https://github.com/endview/nftpf/releases/latest/download/nftpf.sh
+curl -fL --proto '=https' --tlsv1.2 -o nftpf.sh https://github.com/endview/nftpf/releases/latest/download/nftpf.sh
+curl -fL --proto '=https' --tlsv1.2 -o SHA256SUMS https://github.com/endview/nftpf/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS
+bash -n nftpf.sh
 chmod +x nftpf.sh
 sudo bash nftpf.sh
 ```
@@ -35,15 +40,13 @@ After the first run, the tool installs a shortcut:
 nftpf
 ```
 
-## Important Notice
+## Safe Rule Ownership And Persistence
 
-The generated nftables configuration contains:
+Starting with v0.2.0, generated configuration does not contain `flush ruleset`. `nftpf` owns only tables whose names begin with `nftpf_`, validates a delete-and-recreate transaction first, and then commits that transaction atomically. Unrelated nftables and iptables-nft tables remain loaded.
 
-```nft
-flush ruleset
-```
+When upgrading a v0.1.x configuration, the one-time migration removes only the legacy lowercase `prerouting` and `postrouting` chains created by `nftpf` inside `table ip nat` / `table ip6 nat`. Uppercase iptables-nft chains such as `PREROUTING` and `POSTROUTING` are preserved.
 
-That means this tool rewrites the current nftables ruleset when applying managed configuration. Do not use it on hosts where other firewall tools or applications also manage nftables rules unless you understand and accept that behavior.
+Every successful apply also enables `nftables.service` for boot persistence. Use `nftpf --apply` to validate, atomically load, and persist the managed rules. Avoid manually restarting the global nftables service on a host shared with other firewall managers, because some distribution service units flush the complete live ruleset during restart.
 
 ## DDNS Refresh
 
@@ -77,7 +80,26 @@ The default line mode only binds the entry interface and does not change system 
 
 ## Backup And Rollback
 
-Before changing forwarding rules or access-control settings, `nftpf` automatically creates a backup under `/etc/nft-port-forward/backups`. The menu also provides manual backup, import, and rollback to the latest automatic backup.
+Before changing forwarding rules or access-control settings, `nftpf` automatically creates a backup under `/etc/nft-port-forward/backups`. The menu also provides manual backup, import, and rollback to the latest automatic backup. Failed applies restore the previous state files, generated configuration, and service-enable state.
+
+For non-destructive checks, run `nftpf --self-test`. This verifies Bash syntax and renderer invariants without changing system rules.
+
+## Tests
+
+Run the fast checks on any Linux host:
+
+```bash
+bash -n nftpf.sh
+bash nftpf.sh --self-test
+```
+
+The integration test requires root plus `iproute2`, `iptables`, and `nftables`. It creates an isolated network namespace, migrates a simulated v0.1.x ruleset, and verifies that foreign iptables-nft rules survive migration, reapply, failed transactions, and cleanup. It does not modify the host network namespace.
+
+```bash
+sudo bash tests/namespace-integration.sh ./nftpf.sh
+```
+
+The same checks run automatically through GitHub Actions.
 
 ## Script Update
 
@@ -85,13 +107,17 @@ Use menu item `17. 更新脚本` or run `nftpf --update` to download the latest 
 
 ## Uninstall
 
-Use menu item `18. 卸载脚本` or run `nftpf --uninstall` to remove nftpf. The uninstall flow clears the current nftables ruleset, resets nftpf-managed configuration to an empty ruleset, removes DDNS timers/services, removes managed policy-route services and rules, removes state files, and deletes the installed script/shortcut. Backup deletion is optional and defaults to `N`.
+Use menu item `18. 卸载脚本` or run `nftpf --uninstall` to remove nftpf. The uninstall flow removes only nftpf-managed tables, resets nftpf-managed configuration to an empty file, removes DDNS timers/services, removes managed policy-route services and rules, removes state files, and deletes the installed script/shortcut. Backup deletion is optional and defaults to `N`.
 
 The uninstall flow does not remove the `nftables` package and does not disable system IP forwarding sysctl settings, because those may be used by other services.
 
 ## Files
 
 - `nftpf.sh`: Main script.
+- `tests/namespace-integration.sh`: Isolated migration and coexistence regression test.
+- `.github/workflows/ci.yml`: GitHub Actions validation workflow.
+- `CHANGELOG.md`: Versioned change history.
+- `SECURITY.md`: Supported versions and private vulnerability-reporting guidance.
 - `NFT_Port_Forwarding_Tool_PRD.md`: Product requirements and design notes.
 
 ## Requirements
@@ -101,6 +127,7 @@ The uninstall flow does not remove the `nftables` package and does not disable s
 - `bash`.
 - `nftables`.
 - `iproute2`.
+- Debian/Ubuntu for automatic nftables installation. On other systemd distributions, install nftables manually first.
 - Optional: `flock` from `util-linux` for DDNS refresh locking.
 
 ## License
