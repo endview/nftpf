@@ -8,6 +8,7 @@
 
 - 添加单端口 TCP+UDP 转发规则。
 - 添加端口段转发规则，支持 1:1 映射和偏移映射。
+- 可为每条转发规则添加、修改或清空备注，并在规则列表中显示。
 - 支持 IPv4、IPv6、域名/DDNS 目标。
 - 修改实时规则前校验完整 nftables 事务。
 - 原子替换 `nftpf_*` 托管表，不重启全局 nftables 服务。
@@ -39,6 +40,8 @@ sudo bash nftpf.sh
 ```bash
 nftpf
 ```
+
+交互面板中的 `Nftables 状态: 已安装 (v1.0.6)` 显示的是系统 `nft` 命令（nftables 用户态工具）的版本，不是 NFTPF 的版本。NFTPF 自身版本会在下一行单独显示，也可运行 `nftpf --version` 查看。
 
 ## 规则隔离与持久化
 

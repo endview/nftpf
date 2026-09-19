@@ -8,6 +8,7 @@
 
 - Add single-port forwarding rules for TCP and UDP.
 - Add port-range forwarding rules with 1:1 or offset mapping.
+- Add, edit, clear, and display an optional note for each forwarding rule.
 - Support IPv4, IPv6, and domain/DDNS targets.
 - Validate the complete nftables transaction before changing live rules.
 - Atomically replace only `nftpf_*` tables without restarting the global nftables service.
@@ -39,6 +40,8 @@ After the first run, the tool installs a shortcut:
 ```bash
 nftpf
 ```
+
+In the interactive panel, `Nftables status: installed (v1.0.6)` refers to the system `nft` command (the nftables userspace tool), not the nftpf release. The nftpf version is displayed separately and is also available through `nftpf --version`.
 
 ## Safe Rule Ownership And Persistence
 

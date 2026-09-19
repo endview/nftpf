@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.1] - 2026-09-20
+
+### Added
+
+- Added optional notes of up to 100 characters to forwarding rules; notes appear on their own line in rule lists and can be updated or cleared from the quick-edit workflow.
+- Added the NFTPF version to the interactive status panel so it is distinct from the installed nftables version.
+
+### Changed
+
+- Extended `rules.db` records in a backward-compatible way; existing records without a note remain valid.
+
 ## [0.2.0] - 2026-07-10
 
 ### Added

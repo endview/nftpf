@@ -5,7 +5,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-NFTPF_VERSION="${NFTPF_VERSION:-0.2.0}"
+NFTPF_VERSION="${NFTPF_VERSION:-0.2.1}"
 UPDATE_URL="${UPDATE_URL:-https://github.com/endview/nftpf/releases/latest/download/nftpf.sh}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/nftables.conf}"
 STATE_DIR="${STATE_DIR:-/etc/nft-port-forward}"
@@ -743,13 +743,31 @@ join_rule() {
 
 read_rule_fields() {
     local line=$1
-    IFS='|' read -r R_ID R_FAMILY R_LISTEN_IP R_LISTEN_START R_LISTEN_END R_TARGET_TYPE R_TARGET_HOST R_RESOLVED_IP R_TARGET_START R_TARGET_END R_MODE R_PROTOCOL R_LINE_ID R_ROUTE_MODE <<< "$line"
+    IFS='|' read -r R_ID R_FAMILY R_LISTEN_IP R_LISTEN_START R_LISTEN_END R_TARGET_TYPE R_TARGET_HOST R_RESOLVED_IP R_TARGET_START R_TARGET_END R_MODE R_PROTOCOL R_LINE_ID R_ROUTE_MODE R_NOTE <<< "$line"
     R_LINE_ID=${R_LINE_ID:-}
     R_ROUTE_MODE=${R_ROUTE_MODE:-none}
+    R_NOTE=${R_NOTE:-}
     case "$R_ROUTE_MODE" in
         none|iifonly|managed) ;;
         *) R_ROUTE_MODE="none" ;;
     esac
+}
+
+validate_rule_note() {
+    local note=$1
+
+    if [ "${#note}" -gt 100 ]; then
+        echo -e "${RED}错误：备注不能超过 100 个字符。${PLAIN}"
+        return 1
+    fi
+    if [[ "$note" == *"|"* ]]; then
+        echo -e "${RED}错误：备注不能包含竖线字符 |。${PLAIN}"
+        return 1
+    fi
+    if [[ "$note" =~ [[:cntrl:]] ]]; then
+        echo -e "${RED}错误：备注不能包含控制字符。${PLAIN}"
+        return 1
+    fi
 }
 
 join_line() {
@@ -1311,7 +1329,7 @@ import_existing_rules_from_config() {
             [[ -n "$target_start" ]] || continue
         fi
 
-        join_rule "$id" "$family" "$listen_ip" "$listen_start" "$listen_end" "ip" "$PARSED_TARGET_HOST" "$PARSED_TARGET_HOST" "$target_start" "$target_end" "$mode" "tcp_udp" "" "none" >> "$tmp_rules"
+        join_rule "$id" "$family" "$listen_ip" "$listen_start" "$listen_end" "ip" "$PARSED_TARGET_HOST" "$PARSED_TARGET_HOST" "$target_start" "$target_end" "$mode" "tcp_udp" "" "none" "" >> "$tmp_rules"
         id=$((id + 1))
         imported=$((imported + 1))
     done < "$CONFIG_FILE"
@@ -1989,8 +2007,10 @@ prepare_rule_record() {
     local family_choice=$9
     local line_id=${10:-}
     local route_mode=${11:-none}
+    local note=${12:-}
 
     listen_ip=$(normalize_listen_ip "$listen_ip")
+    validate_rule_note "$note" || return 1
     case "$route_mode" in
         none|iifonly|managed) ;;
         *) route_mode="none" ;;
@@ -2027,7 +2047,7 @@ prepare_rule_record() {
         return 1
     fi
 
-    PREPARED_RECORD=$(join_rule "$id" "$CHOSEN_FAMILY" "$listen_ip" "$listen_start" "$listen_end" "$RESOLVED_TARGET_TYPE" "$target_host" "$RESOLVED_TARGET_IP" "$target_start" "$target_end" "$mode" "tcp_udp" "$line_id" "$route_mode")
+    PREPARED_RECORD=$(join_rule "$id" "$CHOSEN_FAMILY" "$listen_ip" "$listen_start" "$listen_end" "$RESOLVED_TARGET_TYPE" "$target_host" "$RESOLVED_TARGET_IP" "$target_start" "$target_end" "$mode" "tcp_udp" "$line_id" "$route_mode" "$note")
 }
 
 lines_file_has_records() {
@@ -2092,6 +2112,7 @@ add_single_rule() {
     local listen_port
     local target_host
     local target_port
+    local note
 
     echo -e "${YELLOW}=== 添加端口转发规则 (TCP+UDP) ===${PLAIN}"
     read -p "监听 IP (留空=自动匹配对应协议族所有地址): " listen_ip
@@ -2105,9 +2126,11 @@ add_single_rule() {
     read -p "目标端口: " target_port
     validate_single_port "$target_port" "目标端口" || { pause_and_return; return; }
     choose_line_for_rule || { pause_and_return; return; }
+    read -r -p "备注 (可选，最多 100 个字符): " note
+    validate_rule_note "$note" || { pause_and_return; return; }
 
     id=$(next_rule_id)
-    prepare_rule_record "$id" "single" "$listen_ip" "$listen_port" "$listen_port" "$target_host" "$target_port" "$target_port" "auto" "$SELECTED_LINE_ID" "$SELECTED_ROUTE_MODE" || { pause_and_return; return; }
+    prepare_rule_record "$id" "single" "$listen_ip" "$listen_port" "$listen_port" "$target_host" "$target_port" "$target_port" "auto" "$SELECTED_LINE_ID" "$SELECTED_ROUTE_MODE" "$note" || { pause_and_return; return; }
 
     if append_rule_record "$PREPARED_RECORD"; then
         echo -e "${GREEN}规则添加成功：ID $id${PLAIN}"
@@ -2126,6 +2149,7 @@ add_range_rule() {
     local target_start
     local target_end
     local count
+    local note
 
     echo -e "${YELLOW}=== 添加端口段转发规则 (TCP+UDP) ===${PLAIN}"
     read -p "监听 IP (留空=自动匹配对应协议族所有地址): " listen_ip
@@ -2159,9 +2183,11 @@ add_range_rule() {
         target_end="$listen_end"
     fi
     choose_line_for_rule || { pause_and_return; return; }
+    read -r -p "备注 (可选，最多 100 个字符): " note
+    validate_rule_note "$note" || { pause_and_return; return; }
 
     id=$(next_rule_id)
-    prepare_rule_record "$id" "$mode" "$listen_ip" "$listen_start" "$listen_end" "$target_host" "$target_start" "$target_end" "auto" "$SELECTED_LINE_ID" "$SELECTED_ROUTE_MODE" || { pause_and_return; return; }
+    prepare_rule_record "$id" "$mode" "$listen_ip" "$listen_start" "$listen_end" "$target_host" "$target_start" "$target_end" "auto" "$SELECTED_LINE_ID" "$SELECTED_ROUTE_MODE" "$note" || { pause_and_return; return; }
 
     if append_rule_record "$PREPARED_RECORD"; then
         echo -e "${GREEN}端口段规则添加成功：ID $id${PLAIN}"
@@ -2203,8 +2229,10 @@ rule_summary_from_current() {
     if [ "$R_ROUTE_MODE" = "managed" ]; then
         line_text="${line_text}+route"
     fi
-
     echo "[$R_ID] [$R_FAMILY] [$mode_text] [$line_text] $listen_display -> $target_display"
+    if [ -n "$R_NOTE" ]; then
+        echo "[备注: $R_NOTE]"
+    fi
 }
 
 view_rules() {
@@ -2269,6 +2297,23 @@ read_with_default() {
     echo "${value:-$default}"
 }
 
+read_note_with_default() {
+    local default=$1
+    local value
+
+    if [ -n "$default" ]; then
+        read -r -p "备注 (回车保留，输入 - 清空) [$default]: " value
+        if [ -z "$value" ]; then
+            value="$default"
+        elif [ "$value" = "-" ]; then
+            value=""
+        fi
+    else
+        read -r -p "备注 (可选，最多 100 个字符): " value
+    fi
+    echo "$value"
+}
+
 quick_edit_rule() {
     local id
     local listen_ip
@@ -2284,6 +2329,7 @@ quick_edit_rule() {
     local line_id
     local route_mode
     local change_line
+    local note
 
     echo -e "${YELLOW}=== 快速修改转发规则 ===${PLAIN}"
     if ! list_rules_compact; then
@@ -2300,6 +2346,7 @@ quick_edit_rule() {
     family_default="$R_FAMILY"
     line_id="$R_LINE_ID"
     route_mode="$R_ROUTE_MODE"
+    note="$R_NOTE"
     listen_ip=$(read_with_default "监听 IP (空=通配)" "$R_LISTEN_IP")
     listen_start=$(read_with_default "监听起始端口" "$R_LISTEN_START")
     listen_end=$(read_with_default "监听结束端口" "$R_LISTEN_END")
@@ -2349,8 +2396,10 @@ quick_edit_rule() {
             route_mode="$SELECTED_ROUTE_MODE"
         fi
     fi
+    note=$(read_note_with_default "$note")
+    validate_rule_note "$note" || { pause_and_return; return; }
 
-    prepare_rule_record "$id" "$mode" "$listen_ip" "$listen_start" "$listen_end" "$target_host" "$target_start" "$target_end" "$family_default" "$line_id" "$route_mode" || { pause_and_return; return; }
+    prepare_rule_record "$id" "$mode" "$listen_ip" "$listen_start" "$listen_end" "$target_host" "$target_start" "$target_end" "$family_default" "$line_id" "$route_mode" "$note" || { pause_and_return; return; }
 
     if update_rule_record "$id" "$PREPARED_RECORD"; then
         echo -e "${GREEN}规则修改成功。${PLAIN}"
@@ -2799,7 +2848,7 @@ refresh_ddns() {
             fi
         fi
 
-        join_rule "$R_ID" "$R_FAMILY" "$R_LISTEN_IP" "$R_LISTEN_START" "$R_LISTEN_END" "$R_TARGET_TYPE" "$R_TARGET_HOST" "$R_RESOLVED_IP" "$R_TARGET_START" "$R_TARGET_END" "$R_MODE" "$R_PROTOCOL" "$R_LINE_ID" "$R_ROUTE_MODE" >> "$tmp_rules"
+        join_rule "$R_ID" "$R_FAMILY" "$R_LISTEN_IP" "$R_LISTEN_START" "$R_LISTEN_END" "$R_TARGET_TYPE" "$R_TARGET_HOST" "$R_RESOLVED_IP" "$R_TARGET_START" "$R_TARGET_END" "$R_MODE" "$R_PROTOCOL" "$R_LINE_ID" "$R_ROUTE_MODE" "$R_NOTE" >> "$tmp_rules"
     done < "$RULES_FILE"
 
     if [ "$changed" -eq 0 ]; then
@@ -3954,6 +4003,9 @@ self_test() {
     local tmp_dir
     local tmp_rules
     local tmp_config
+    local legacy_record
+    local noted_record
+    local noted_config
     local saved_rules_file=$RULES_FILE
     local saved_lines_file=$LINES_FILE
     local saved_access_file=$ACCESS_FILE
@@ -3982,6 +4034,37 @@ self_test() {
     grep -q '^table ip6 nftpf_nat {' "$tmp_config" || { echo 'self-test: IPv6 managed NAT table missing' >&2; rm -rf "$tmp_dir"; return 1; }
     if grep -q '^flush ruleset$' "$tmp_config"; then
         echo 'self-test: generated config must not flush the global ruleset' >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    legacy_record='1|ipv4||18080|18080|ip|192.0.2.10|192.0.2.10|8080|8080|single|tcp_udp||none'
+    read_rule_fields "$legacy_record"
+    if [[ -n "$R_NOTE" || "$R_ROUTE_MODE" != "none" ]]; then
+        echo 'self-test: legacy rule record compatibility failed' >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    noted_record=$(join_rule "1" "ipv4" "" "18080" "18080" "ip" "192.0.2.10" "192.0.2.10" "8080" "8080" "single" "tcp_udp" "" "none" "Web service")
+    read_rule_fields "$noted_record"
+    if [[ "$R_NOTE" != "Web service" ]]; then
+        echo 'self-test: rule note round trip failed' >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if validate_rule_note 'invalid|note' >/dev/null 2>&1; then
+        echo 'self-test: invalid rule note delimiter was accepted' >&2
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    noted_config="$tmp_dir/noted.nft"
+    printf '%s\n' "$noted_record" > "$tmp_rules"
+    generate_config_from_rules "$tmp_rules" > "$noted_config"
+    grep -q 'th dport 18080 dnat to 192.0.2.10:8080' "$noted_config" || { echo 'self-test: noted rule was not rendered' >&2; rm -rf "$tmp_dir"; return 1; }
+    if grep -q 'Web service' "$noted_config"; then
+        echo 'self-test: management note leaked into nftables config' >&2
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -4068,6 +4151,7 @@ main_menu() {
     echo -e "#            NFT端口转发简易化工具             #"
     echo -e "################################################"
     echo -e "Nftables 状态: ${INSTALL_STATUS}"
+    echo -e "NFTPF    版本: ${GREEN}v${NFTPF_VERSION}${PLAIN}"
     echo -e "实时规则 状态: ${RUN_STATUS}"
     echo -e "开机自启 状态: ${BOOT_STATUS}"
     echo -e "IP转发   状态: ${FW_STATUS}"
