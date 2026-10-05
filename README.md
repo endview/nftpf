@@ -88,7 +88,7 @@ sudo nftpf --jool-pacing off   # restore the default, unpaced behavior
 
 The setting survives rule reapply, reboot, and backup/restore. Changing it preserves translators and existing TCP connections. Only the private namespace's `nftpf0` egress queue is configured; physical NICs, host queues, congestion control, MTU, and offloads stay as configured. Foreign queues are rejected, and a failed update restores the previous setting and managed queues. Old backups without the setting restore pacing to off.
 
-Choose the rate through measurements on your path. On Akari HK/TW, a 300 Mbps flow cap increased four-stream TCP from a median 430 Mbps to about 1.11 Gbps; both translation directions and reverse traffic were verified. One stream was about 276 Mbps under the cap. This is a per-flow limit, not a server-wide bandwidth limit or a guarantee of higher speed on another path. See the [benchmark and reproduction guide](docs/jool-performance-2026-10-06.md).
+Keep pacing off for internal networks and paths that already perform well. On the two-leg Akari HK/TW WAN path, a 300 Mbps flow cap increased four-stream TCP from a median 430 Mbps to about 1.11 Gbps; one stream remained about 276 Mbps. Isolated tests inside Hytron and Akari HK reached multiple Gbps unpaced, and the same cap reduced their throughput. Treat 300 as a candidate for that WAN condition and validate single-stream and UDP requirements. See the [configuration recommendations and four-test evidence (Chinese)](docs/jool-configuration-recommendations.zh-CN.md), the [complete internal dataset](docs/benchmarks/jool-internal-2026-10-06.csv), and the [WAN benchmark and reproduction guide](docs/jool-performance-2026-10-06.md).
 
 ## DDNS Refresh
 

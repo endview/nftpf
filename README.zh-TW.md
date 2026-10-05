@@ -88,7 +88,7 @@ sudo nftpf --jool-pacing off   # 關閉，恢復預設行為
 
 設定會隨規則重新套用、重啟和備份恢復保留。修改設定保留轉換器和既有 TCP 連線，只調整私有命名空間內 `nftpf0` 的出口佇列。實體網卡、宿主佇列、擁塞演算法、MTU 和卸載開關沿用原設定。非託管佇列會拒絕覆寫；更新失敗會回滾設定和已調整的託管佇列。舊備份沒有此設定時，恢復為關閉。
 
-速率需依實際線路測試選擇。Akari HK/TW 測試中，每流 300 Mbps 使四路 TCP 從預設配置中位數約 430 Mbps 提升至約 1.11 Gbps，兩種轉換方向和反向流量均已驗證；單路在此上限下約 276 Mbps。這是每流上限，不是整機頻寬限制，也不保證其他線路有相同提升。詳見[測試記錄與復現方法](docs/jool-performance-2026-10-06.md)。
+內網與已正常工作的線路建議維持預設關閉。Akari HK/TW 兩段公網測試中，每流 300 Mbps 使四路 TCP 中位數從約 430 Mbps 提升至約 1.11 Gbps，單路仍約 276 Mbps；隨後在 Hytron、Akari HK 同機隔離內網中，預設 Jool 達到數 Gbps，同樣的上限反而降低吞吐。300 僅作為這類公網條件下的待測候選，單連線與 UDP 需求需分別驗證。詳見[配置建議與四輪測試彙整（簡體中文）](docs/jool-configuration-recommendations.zh-CN.md)、[完整內網資料](docs/benchmarks/jool-internal-2026-10-06.csv)及[公網測試與重現方法](docs/jool-performance-2026-10-06.md)。
 
 ## DDNS 刷新
 

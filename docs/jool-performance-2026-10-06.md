@@ -2,6 +2,8 @@
 
 These measurements use the nftpf v0.3.0 translation path plus the optional namespace-egress pacing implementation on this branch. They are observations of one WAN path, not a Jool performance ceiling or a general bandwidth guarantee.
 
+Subsequent isolated tests inside Hytron and Akari HK reached multiple Gbps with pacing off. The 300 Mbps cap reduced their throughput. Keep it as an opt-in candidate for problematic WAN conditions; see the [configuration recommendations and four-test summary (Chinese)](jool-configuration-recommendations.zh-CN.md), [all 102 earlier WAN cases](benchmarks/jool-wan-2026-10-05-06.csv), and [164 controlled internal cases](benchmarks/jool-internal-2026-10-06.csv). Different durations and topologies are reported separately.
+
 ## Path and method
 
 - Relay: Akari HK, one AMD EPYC vCPU, Debian 12, kernel `6.1.0-52-cloud-amd64`.
@@ -11,7 +13,7 @@ These measurements use the nftpf v0.3.0 translation path plus the optional names
 - Each throughput sample measures 30 seconds after a three-second warmup. Reported rates are receiver payload rates. CPU is whole-machine utilization during measurement, not isolated Jool CPU.
 - Use the same public addresses and isolated ports, alternate defaults and candidates, and repeat promising candidates. No data tests run concurrently.
 - Record iperf JSON, 250 ms CPU samples, Jool statistics, link counters, qdisc counters, and TCP/softnet statistics around every case.
-- Specify `-C bbr` in every test and check both reported congestion algorithms. A persistent iperf server retained CUBIC after a CUBIC test; four mixed-algorithm samples (two forward and two reverse) were excluded.
+- Specify `-C bbr` in BBR tests and check both reported congestion algorithms. One deliberate comparator used CUBIC on both endpoints. A persistent iperf server retained CUBIC afterward; four mixed-algorithm samples (two forward and two reverse) were excluded.
 
 ## Results
 
@@ -27,7 +29,7 @@ IPv6 entry → IPv4 backend, four forward TCP streams:
 
 Namespace-only pacing at 300 Mbps also produced 1095.98 Mbps in reverse, 1092.97 Mbps through an IPv4 entry → IPv6 backend, and 1107.83 Mbps in reverse through that entry. A single forward stream was 275.63 Mbps under the cap, with 2,828 reported retransmissions. The rate cap limits that stream; the four-stream result is not a single-stream gigabit result.
 
-The integrated nftpf command produced 1120.20/1097.57 Mbps through the IPv6 entry and 1096.03/1116.13 Mbps through the IPv4 entry. At 100 Mbps UDP with 1200-byte payloads, it delivered 99.98/99.96 Mbps with 0.028%/0.053% loss. Idle TCP/UDP echo medians were 26.78–26.90 ms paced and 26.81–26.84 ms unpaced, 30 requests per group with no errors; this is not a loaded-latency measurement. Unpaced IPv4-entry samples varied from 53.85 to 211.89 Mbps forward and 159.21 to 790.55 Mbps reverse, reinforcing the need for repeats.
+The integrated nftpf command produced 1120.20/1097.57 Mbps through the IPv6 entry and 1096.03/1116.13 Mbps through the IPv4 entry. At 100 Mbps UDP with 1200-byte payloads, it delivered 99.98/99.96 Mbps with client-reported loss of 0.028%/0.053%. The later controlled tests identified inconsistent UDP omission accounting in iperf3 3.12's client-transferred report. Those legacy percentages are retained as reported and should not be compared precisely with the later receiver-local loss values. The new dataset uses backend-local JSON and checks its bytes/packet/loss accounting. Idle TCP/UDP echo medians were 26.78–26.90 ms paced and 26.81–26.84 ms unpaced, 30 requests per group with no errors; this is not a loaded-latency measurement. Unpaced IPv4-entry samples varied from 53.85 to 211.89 Mbps forward and 159.21 to 790.55 Mbps reverse, reinforcing the need for repeats.
 
 Default forward retransmission counts across the five IPv6-entry samples had a median of 321,361; the three repeated namespace-pacing samples had a median of 26,826. Kernel and Jool counters did not show a corresponding translator, veth, softnet, or physical-qdisc drop increase in the initial slow sample. This does not prove the absence of WAN loss or locate its exact cause.
 
