@@ -10,6 +10,7 @@
 - 添加端口段转发规则，支持 1:1 映射和偏移映射。
 - 可为每条转发规则添加、修改或清空备注，并在规则列表中显示。
 - 支持 IPv4、IPv6、域名/DDNS 目标。
+- IPv6→IPv4、IPv4→IPv6 跨协议族规则自动使用 Jool Stateful NAT64。
 - 修改实时规则前校验完整 nftables 事务。
 - 原子替换 `nftpf_*` 托管表，不重启全局 nftables 服务。
 - 每次成功应用规则时启用 nftables 开机自启，并分别显示实时规则与开机持久化状态。
@@ -50,6 +51,24 @@ nftpf
 从 v0.1.x 升级时，一次性迁移只删除 `nftpf` 旧版在 `table ip nat` / `table ip6 nat` 中创建的小写 `prerouting`、`postrouting` 链；iptables-nft 使用的大写 `PREROUTING`、`POSTROUTING` 等链会保留。
 
 每次成功应用都会启用 `nftables.service` 开机自启。可以运行 `nftpf --apply` 校验、原子加载并持久化托管规则。如果主机同时运行其它防火墙管理程序，请避免手动重启全局 nftables 服务，因为部分发行版的 service 在重启时会清空整个实时 ruleset。
+
+## Jool 跨协议族转发
+
+同族规则继续直接使用 nftables。入口与目标协议族不同时，每条规则会使用独立的 Jool 网络命名空间和 veth：IPv6→IPv4 使用动态 NAT64 会话，IPv4→IPv6 使用静态 TCP/UDP BIB 发布后端。两种方向均支持单端口、端口段 1:1 和偏移映射。
+
+先安装与运行内核匹配的 headers、DKMS、Jool 4.x 内核模块及用户态工具。Debian/Ubuntu 可以使用菜单 `19` 或：
+
+```bash
+sudo nftpf --install-jool
+```
+
+正常添加规则即可：IPv6 监听地址配 IPv4 目标会选择 v6→v4，反过来选择 v4→v6。`::` 表示 IPv6 通配入口，`0.0.0.0` 表示 IPv4 通配入口；留空仍为自动选择。域名的目标解析类型 `auto/4/6` 与入口族分别保存，DDNS 刷新沿用目标族。固定目标无需 DNS64。
+
+每条规则的内部地址来自 `198.18.0.0/15`，IPv6 veth 链路来自 `fd64:6e66:7471::/48`，转换前缀来自 `fd64:6e66:7470::/48`。检测到重叠路由或同名非托管命名空间/接口会拒绝应用。Jool 规则 ID 限制为 `1-32767`。物理网卡保留在宿主命名空间，现有转发防火墙需允许新增 veth 路径。
+
+`nftpf-jool.service` 在网络、nftables 和托管路由服务之后恢复转换器。`--apply-jool` 只恢复转换器与路由，`--jool-status` 查看状态，`--stop-jool` 停止托管转换器但保留 nftables 规则。删除、清空、停止和卸载会清理对应命名空间/接口，不卸载共享 Jool 模块。重复应用会复用未变的转换器；修改后端连接参数会重建该规则的转换器，中断它的既有会话。nftables 事务保持原子提交，Jool 资源在提交前准备、失败时回滚；已经中断或过期的会话无法恢复。
+
+访问控制和源地址观察仍匹配原入口族。专属 forward 规则拒绝直接访问转换器内部地址/前缀，避免绕过公网入口访问控制。托管回程表会补充通向转换器的路由，物理线路 mark 在 Jool 命名空间内清除。Jool 支持原生 UDP，但入口前的运营商丢包或过滤需要单独排查。IPv4→IPv6 大端口段会为每个端口和协议建立静态 BIB，应用时间相应增加。
 
 ## DDNS 刷新
 
@@ -98,6 +117,7 @@ Unit=nftpf-ddns.service
 ```bash
 bash -n nftpf.sh
 bash nftpf.sh --self-test
+bash tests/jool-renderer.sh ./nftpf.sh
 ```
 
 集成测试需要 root，以及 `iproute2`、`iptables`、`nftables`。测试会创建隔离网络命名空间，模拟 v0.1.x 规则迁移，并验证外部 iptables-nft 规则在迁移、重复应用、错误事务和清理后仍保持不变；不会修改宿主网络命名空间。
@@ -107,6 +127,14 @@ sudo bash tests/namespace-integration.sh ./nftpf.sh
 ```
 
 GitHub Actions 会自动运行同一组检查。
+
+真实 Jool 链路测试需要已加载的兼容内核模块、root、Python 3，以及网络/挂载命名空间支持：
+
+```bash
+sudo bash tests/jool-integration.sh ./nftpf.sh
+```
+
+测试覆盖两种方向的 TCP/UDP、偏移端口段、转换器复用、提交失败回滚、恢复和外部 Jool/防火墙资源共存。CI 还会在 Debian 内核与匹配 DKMS 模块的 QEMU 虚拟机中执行该测试。安装发行版内核镜像/headers、Jool DKMS/工具、`qemu-system-x86`、`busybox-static`、`cpio`、`xz-utils`、Python 3 后，可运行 `sudo bash tests/qemu-jool-integration.sh ./nftpf.sh` 复现。
 
 ## 脚本更新
 
@@ -135,7 +163,8 @@ GitHub Actions 会自动运行同一组检查。
 - `nftables`。
 - `iproute2`。
 - Debian/Ubuntu 可自动安装 nftables；其它 systemd 发行版请先手动安装。
-- 可选：`util-linux` 中的 `flock`，用于 DDNS 刷新防重叠执行。
+- `util-linux` 中的 `flock`，用于串行处理状态、规则和 Jool 生命周期修改。
+- 跨协议族规则需 Jool 4.x 用户态工具及与当前内核匹配的模块。Jool 安装为显式操作，同族规则无需安装。
 
 ## 许可证
 
