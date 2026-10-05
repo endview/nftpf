@@ -76,6 +76,20 @@ Access lists and source tracking match the original entry family. A scoped forwa
 
 Cross-family translation does not guarantee higher throughput than a TCP relay. Real WAN comparisons with Realm found lower Jool relay CPU at equal rates, but lower and variable unrestricted TCP throughput on the tested path. Benchmark your intended path before choosing a forwarding method.
 
+### Optional Per-Flow Pacing
+
+This development feature is not included in the published v0.3.0 release. Menu `19` or these commands save an optional rate cap for each TCP/UDP flow in every managed Jool translator:
+
+```bash
+sudo nftpf --jool-pacing 300   # 300 Mbps per flow; applies to live translators
+sudo nftpf --jool-status
+sudo nftpf --jool-pacing off   # restore the default, unpaced behavior
+```
+
+The setting survives rule reapply, reboot, and backup/restore. Changing it preserves translators and existing TCP connections. Only the private namespace's `nftpf0` egress queue is configured; physical NICs, host queues, congestion control, MTU, and offloads stay as configured. Foreign queues are rejected, and a failed update restores the previous setting and managed queues. Old backups without the setting restore pacing to off.
+
+Choose the rate through measurements on your path. On Akari HK/TW, a 300 Mbps flow cap increased four-stream TCP from a median 430 Mbps to about 1.11 Gbps; both translation directions and reverse traffic were verified. One stream was about 276 Mbps under the cap. This is a per-flow limit, not a server-wide bandwidth limit or a guarantee of higher speed on another path. See the [benchmark and reproduction guide](docs/jool-performance-2026-10-06.md).
+
 ## DDNS Refresh
 
 Domain targets are stored with their resolved IP address. You can refresh them manually from the menu, or enable automatic refresh. Automatic refresh is managed by a systemd timer, so sub-minute intervals such as `30s` or `0.5m` are supported.

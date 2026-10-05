@@ -2,7 +2,7 @@
 set -euo pipefail
 script=$(realpath "${1:?usage: jool-integration.sh /path/to/nftpf.sh}")
 [[ "$EUID" -eq 0 ]] || { echo 'must run as root' >&2; exit 1; }
-for dependency in jool modprobe nft ip python3 unshare; do command -v "$dependency" >/dev/null; done
+for dependency in jool modprobe nft ip tc python3 unshare; do command -v "$dependency" >/dev/null; done
 modprobe jool
 
 # Isolate /run/netns as well as networking: no namespace names or routes leak out.
@@ -78,8 +78,10 @@ def serve(family, sock_type, host, port):
         while True:
             client, peer = sock.accept()
             with client:
-                data = client.recv(8192)
-                client.sendall(data)
+                while True:
+                    data = client.recv(8192)
+                    if not data: break
+                    client.sendall(data)
     else:
         while True:
             data, peer = sock.recvfrom(8192)
@@ -155,6 +157,91 @@ apply_config_changes
 [[ "$(cat "$JOOL_STATE_DIR/1.inode")" == "$inode_before" ]]
 probe 2001:db8:1::1 4060 tcp
 
+# Optional pacing owns only the namespace egress queue and preserves translators.
+[[ "$(jool_read_pacing_rate)" == 0 ]]
+for rate in '' -1 01 100001 '300;echo bad'; do
+    if set_jool_pacing "$rate" >/dev/null 2>&1; then exit 1; fi
+done
+tc qdisc replace dev entry0 root handle 9fff: fq
+ip netns exec nftpf-jool-1 tc qdisc replace dev nftpf0 root handle 8fff: fq
+if set_jool_pacing 300 >/dev/null 2>&1; then echo 'foreign queue was overwritten' >&2; exit 1; fi
+ip netns exec nftpf-jool-1 tc qdisc show dev nftpf0 | grep -q 'fq 8fff:'
+[[ "$(jool_read_pacing_rate)" == 0 ]]
+ip netns exec nftpf-jool-1 tc qdisc del dev nftpf0 root
+ip netns exec client python3 - "$work" <<'PY' &
+import pathlib,socket,sys,time
+work=pathlib.Path(sys.argv[1])
+with socket.create_connection(('2001:db8:1::1',4060),timeout=5) as sock:
+    sock.sendall(b'before-pacing');assert sock.recv(128)==b'before-pacing'
+    work.joinpath('connection-ready').touch()
+    deadline=time.monotonic()+15
+    while not work.joinpath('pacing-enabled').exists():
+        assert time.monotonic()<deadline
+        time.sleep(.05)
+    sock.sendall(b'after-pacing');assert sock.recv(128)==b'after-pacing'
+print('PASS persistent TCP connection survives pacing enable')
+PY
+connection_pid=$!
+for attempt in {1..100}; do [[ ! -f "$work/connection-ready" ]] || break; sleep .05; done
+[[ -f "$work/connection-ready" ]]
+set_jool_pacing 300
+touch "$work/pacing-enabled"
+wait "$connection_pid"
+[[ "$(jool_read_pacing_rate)" == 300 ]]
+[[ "$(cat "$JOOL_STATE_DIR/1.inode")" == "$inode_before" ]]
+assert_pacing() {
+    ip netns exec "nftpf-jool-$1" tc -j qdisc show dev nftpf0 |
+        python3 -c 'import json,sys; q=json.load(sys.stdin)[0]; assert q["kind"]=="fq" and q["handle"]=="7fff:" and q["options"]["maxrate"]==37500000, q'
+}
+assert_pacing 1
+assert_pacing 2
+tc qdisc show dev entry0 | grep -q 'fq 9fff:'
+tc qdisc show dev npj1 | grep -q noqueue
+for proto in tcp udp; do
+    probe 2001:db8:1::1 4060 "$proto"
+    probe 192.0.2.1 4061 "$proto"
+done
+apply_config_changes
+assert_pacing 1
+[[ "$(cat "$JOOL_STATE_DIR/1.inode")" == "$inode_before" ]]
+
+# A partial queue update restores the persisted value and queues already changed.
+touch "$work/fail-pacing-once"
+ip() {
+    if [[ "$*" == 'netns exec nftpf-jool-2 tc qdisc replace '* && -e "$work/fail-pacing-once" ]]; then
+        rm "$work/fail-pacing-once"
+        return 1
+    fi
+    command ip "$@"
+}
+if set_jool_pacing 400; then echo 'injected pacing failure succeeded' >&2; exit 1; fi
+unset -f ip
+[[ "$(jool_read_pacing_rate)" == 300 ]]
+assert_pacing 1
+assert_pacing 2
+create_state_backup pacing-test 1
+tar -tzf "$LAST_BACKUP_PATH" | grep -q jool-pacing.conf
+cp "$LAST_BACKUP_PATH" "$work/paced.tar.gz"
+mkdir "$work/legacy"
+tar -xzf "$LAST_BACKUP_PATH" -C "$work/legacy"
+rm "$work/legacy/jool-pacing.conf"
+tar -czf "$work/legacy.tar.gz" -C "$work/legacy" .
+nft_run() {
+    if [[ "${1:-}" == -f ]]; then return 1; fi
+    "$REAL_NFT_CMD" "$@"
+}
+if restore_backup_path "$work/legacy.tar.gz"; then echo 'injected import failure succeeded' >&2; exit 1; fi
+[[ "$(jool_read_pacing_rate)" == 300 ]]
+assert_pacing 1
+unset -f nft_run
+nft_run() { "$REAL_NFT_CMD" "$@"; }
+restore_backup_path "$work/legacy.tar.gz"
+[[ "$(jool_read_pacing_rate)" == 0 ]]
+ip netns exec nftpf-jool-1 tc qdisc show dev nftpf0 | grep -q noqueue
+restore_backup_path "$work/paced.tar.gz"
+assert_pacing 1
+[[ "$(cat "$JOOL_STATE_DIR/1.inode")" == "$inode_before" ]]
+
 # Match source ACLs against the original entry, not the translated backend family.
 printf '%s\n' mode=blacklist 'entry=ipv6|2001:db8:1::2' > "$ACCESS_FILE"
 generate_config_from_rules "$RULES_FILE" > "$CONFIG_FILE"
@@ -182,6 +269,7 @@ nft_run() {
 }
 if apply_config_changes; then echo 'injected nft failure unexpectedly succeeded' >&2; exit 1; fi
 grep -Fq '|2444|2444|' "$JOOL_STATE_DIR/1.rule"
+assert_pacing 1
 unset -f nft_run
 nft_run() { "$REAL_NFT_CMD" "$@"; }
 cp "$work/previous.db" "$RULES_FILE"
@@ -238,15 +326,24 @@ if ip link show npj3 >/dev/null 2>&1; then exit 1; fi
 probe 192.0.2.1 4061 udp
 stop_jool_runtime
 apply_jool_runtime
+assert_pacing 1
+assert_pacing 2
 probe 2001:db8:1::1 4060 tcp
 probe 192.0.2.1 4061 udp
 nft list table inet foreign_guard | grep -q foreign-guard
 ip netns exec foreign-jool jool -i foreign global display >/dev/null
+
+set_jool_pacing off
+[[ "$(jool_read_pacing_rate)" == 0 ]]
+ip netns exec nftpf-jool-1 tc qdisc show dev nftpf0 | grep -q noqueue
+[[ ! -f "$JOOL_STATE_DIR/1.pacing" ]]
+probe 2001:db8:1::1 4060 tcp
+tc qdisc show dev entry0 | grep -q 'fq 9fff:'
 
 unload_managed_rules
 stop_jool_runtime
 [[ -z "$(ip netns list | awk '$1 ~ /^nftpf-jool-/ {print $1}')" ]]
 nft list table inet foreign_guard >/dev/null
 ip netns exec foreign-jool jool -i foreign global display >/dev/null
-echo '[OK] real Jool TCP/UDP, both directions, ranges, policy routes, ACLs, reuse, edits, rollback, restore, collision safety, and coexistence tests passed.'
+echo '[OK] real Jool TCP/UDP, both directions, pacing, persistent TCP, backups, ranges, policy routes, ACLs, reuse, edits, rollback, restore, collision safety, and coexistence tests passed.'
 TEST
