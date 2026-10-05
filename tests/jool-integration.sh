@@ -62,6 +62,10 @@ ip netns exec backend ip -6 addr add 2001:db8:2::2/64 dev eth0 nodad
 sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 sysctl -qw net.ipv4.conf.all.rp_filter=0
 
+# Multipath defaults must not be mistaken for private-prefix collisions.
+ip -4 route add default nexthop via 192.0.2.2 dev entry0 weight 1 nexthop via 198.51.100.2 dev exit0 weight 1
+ip -6 route add default nexthop via 2001:db8:1::2 dev entry0 weight 1 nexthop via 2001:db8:2::2 dev exit0 weight 1
+
 cat > "$work/echo.py" <<'PY'
 import socket, sys, threading, time
 def serve(family, sock_type, host, port):
@@ -81,7 +85,7 @@ def serve(family, sock_type, host, port):
             data, peer = sock.recvfrom(8192)
             sock.sendto(data, peer)
 for family, host in [(socket.AF_INET, '198.51.100.2'), (socket.AF_INET6, '2001:db8:2::2')]:
-    for port in (2443, 2444, 2445):
+    for port in (2443, 2444, 2445, 53211):
         for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
             threading.Thread(target=serve, args=(family, kind, host, port), daemon=True).start()
 time.sleep(300)
@@ -113,6 +117,7 @@ cat > "$RULES_FILE" <<'EOF'
 5|ipv4|192.0.2.1|4300|4300|ip|198.51.100.2|198.51.100.2|2443|2443|single|tcp_udp||none|same family
 6|ipv6|2001:db8:1::1|4400|4400|ip|198.51.100.2|198.51.100.2|2443|2443|single|tcp_udp|1|managed|managed NAT64|ipv4
 7|ipv4|192.0.2.1|4401|4401|ip|2001:db8:2::2|2001:db8:2::2|2443|2443|single|tcp_udp|1|managed|managed BIB|ipv6
+8|ipv4|192.0.2.1|4500|4500|ip|2001:db8:2::2|2001:db8:2::2|53211|53211|single|tcp_udp||none|high-port static BIB|ipv6
 EOF
 echo '1|test-entry|entry0|192.0.2.1|2001:db8:1::1|managed|1062|5004|5006|192.0.2.2|2001:db8:1::2|1' > "$LINES_FILE"
 ip -4 route add 192.0.2.0/24 dev entry0 table 5004
@@ -139,6 +144,7 @@ for proto in tcp udp; do
     probe 192.0.2.1 4300 "$proto"
     probe 2001:db8:1::1 4400 "$proto"
     probe 192.0.2.1 4401 "$proto"
+    probe 192.0.2.1 4500 "$proto"
 done
 ip -6 route show table 5006 | grep -q npj6
 ip -4 route show table 5004 | grep -q npj7

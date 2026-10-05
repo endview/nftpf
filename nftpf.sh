@@ -1411,7 +1411,8 @@ jool_preflight_record() {
     if ip link show dev "$J_VETH" >/dev/null 2>&1 && ! jool_link_owned; then
         echo "错误：$J_VETH 已存在且不属于本工具，未修改。" >&2; return 1
     fi
-    routes=$(ip -4 route show table all match "$J_NET4"; ip -6 route show table all match "$J_POOL6")
+    # Keep ECMP next hops on their route's line so default routes are ignored.
+    routes=$(ip -o -4 route show table all match "$J_NET4"; ip -o -6 route show table all match "$J_POOL6")
     if printf '%s\n' "$routes" | grep -vE "^(default|$)| dev $J_VETH( |$)" | grep -q .; then
         echo "错误：Jool 私网 $J_NET4 / $J_POOL6 与现有路由冲突，未修改。" >&2; return 1
     fi
@@ -1464,6 +1465,7 @@ jool_set_root_routes() {
 
 jool_ensure_record() {
     local record=$1 saved_key new_key protocol port ports
+    local -a pool4_flags=()
     read_rule_fields "$record"
     jool_addresses "$R_ID" || return 1
     jool_preflight_record || return 1
@@ -1513,9 +1515,14 @@ table inet nftpf_jool {
 EOF
     ip netns exec "$J_NAME" jool instance add nftpf --netfilter --pool6 "$J_POOL6" || return 1
     ports=61001-65535
-    if [[ "$R_FAMILY" == "ipv4" ]]; then ports="$R_TARGET_START-$R_TARGET_END"; fi
+    if [[ "$R_FAMILY" == "ipv4" ]]; then
+        ports="$R_TARGET_START-$R_TARGET_END"
+        # This isolated namespace has no TCP/UDP applications. Static BIB ports
+        # may therefore safely overlap its default ephemeral socket range.
+        pool4_flags=(--force)
+    fi
     for protocol in tcp udp; do
-        ip netns exec "$J_NAME" jool -i nftpf pool4 add "--$protocol" "$J_NS4" "$ports" || return 1
+        ip netns exec "$J_NAME" jool -i nftpf pool4 add "--$protocol" "${pool4_flags[@]}" "$J_NS4" "$ports" || return 1
         if [[ "$R_FAMILY" == "ipv4" ]]; then
             for ((port=R_TARGET_START; port<=R_TARGET_END; port++)); do
                 ip netns exec "$J_NAME" jool -i nftpf bib add "--$protocol" "$J_NS4#$port" "$R_RESOLVED_IP#$port" || return 1
