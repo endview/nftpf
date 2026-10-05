@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
 
+Current release: [v0.3.0](https://github.com/endview/nftpf/releases/tag/v0.3.0).
+
 `nftpf` is an interactive Linux port-forwarding tool built on top of nftables. It is designed to make IPv4, IPv6, and DDNS-based forwarding rules easier to manage from a simple terminal menu.
 
 ## Features
@@ -62,6 +64,8 @@ Install matching kernel headers, DKMS, the Jool 4.x kernel module, and its users
 sudo nftpf --install-jool
 ```
 
+Keep the Jool kernel module and userspace tools at the same version. If your distribution no longer provides headers for the running kernel, use a supported kernel with matching headers before installing Jool. Same-family rules do not require Jool.
+
 Add rules normally: enter an IPv6 listen address and IPv4 target for v6-to-v4, or the reverse for v4-to-v6. Use `::` or `0.0.0.0` to choose an IPv6 or IPv4 wildcard entry; leaving the entry blank retains automatic family selection. Domain target resolution (`auto/4/6`) is independent of the entry family and is retained for DDNS refresh. Fixed targets do not require DNS64.
 
 The tool reserves per-rule private veth subnets within `198.18.0.0/15`, IPv6 link prefixes within `fd64:6e66:7471::/48`, and translation prefixes within `fd64:6e66:7470::/48`. Overlapping routes or foreign namespace/interface names cause an apply failure. Jool rule IDs must be in `1-32767`. Physical interfaces stay in the host namespace; an existing host forwarding firewall must permit the new veth paths.
@@ -69,6 +73,8 @@ The tool reserves per-rule private veth subnets within `198.18.0.0/15`, IPv6 lin
 `nftpf-jool.service` restores translators at boot after networking, nftables, and the managed route service. `--apply-jool` restores only translators/routes; `--jool-status` reports their state; `--stop-jool` removes owned translators while leaving nftables rules in place. Delete, clear, stop, and uninstall remove owned namespaces and links without unloading shared Jool modules. Reapply reuses unchanged translators; changing backend connection parameters recreates that rule's translator and interrupts its existing sessions. nftables commits remain atomic; Jool resources are prepared before the commit and restored on failure, but expired or interrupted sessions cannot be restored.
 
 Access lists and source tracking match the original entry family. A scoped forward guard rejects direct access to private translator addresses/prefixes, so those paths cannot bypass the public entry ACL. Managed return-route tables receive routes toward the translator, and physical-line marks are cleared inside its namespace. Jool supports native UDP; carrier packet loss or filtering before the entry still needs separate diagnosis. Large IPv4-to-IPv6 ranges require one static BIB entry per port and protocol and can take longer to apply.
+
+Cross-family translation does not guarantee higher throughput than a TCP relay. Real WAN comparisons with Realm found lower Jool relay CPU at equal rates, but lower and variable unrestricted TCP throughput on the tested path. Benchmark your intended path before choosing a forwarding method.
 
 ## DDNS Refresh
 
