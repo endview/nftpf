@@ -1338,7 +1338,8 @@ EOF
         [[ -z "$R_LISTEN_IP" ]] || original="ct original $addr daddr $R_LISTEN_IP "
         echo "        oifname \"$J_VETH\" ct state {established, related} accept"
         echo "        iifname \"$J_VETH\" ct state {established, related} accept"
-        echo "        ${line_match}oifname \"$J_VETH\" ct status dnat ${original}ct original proto-dst $R_LISTEN_START-$R_LISTEN_END $addr daddr $target meta l4proto {tcp, udp} th dport $R_TARGET_START-$R_TARGET_END accept"
+        # nftables 1.0.x needs the L4 selector before conntrack port expressions.
+        echo "        ${line_match}oifname \"$J_VETH\" meta l4proto {tcp, udp} ct status dnat ${original}ct original proto-dst $R_LISTEN_START-$R_LISTEN_END $addr daddr $target th dport $R_TARGET_START-$R_TARGET_END accept"
         if [[ "$R_TARGET_FAMILY" == "ipv4" ]]; then
             addr=ip; mask="$J_NS4"
         else
