@@ -5,7 +5,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-NFTPF_VERSION="${NFTPF_VERSION:-0.2.1}"
+NFTPF_VERSION="${NFTPF_VERSION:-0.3.0}"
 UPDATE_URL="${UPDATE_URL:-https://github.com/endview/nftpf/releases/latest/download/nftpf.sh}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/nftables.conf}"
 STATE_DIR="${STATE_DIR:-/etc/nft-port-forward}"
@@ -20,11 +20,13 @@ CRON_FILE="${CRON_FILE:-/etc/cron.d/nft-port-forward-ddns}"
 DDNS_SERVICE_FILE="${DDNS_SERVICE_FILE:-/etc/systemd/system/nftpf-ddns.service}"
 DDNS_TIMER_FILE="${DDNS_TIMER_FILE:-/etc/systemd/system/nftpf-ddns.timer}"
 ROUTE_SERVICE_FILE="${ROUTE_SERVICE_FILE:-/etc/systemd/system/nftpf-route.service}"
+JOOL_SERVICE_FILE="${JOOL_SERVICE_FILE:-/etc/systemd/system/nftpf-jool.service}"
+JOOL_STATE_DIR="${JOOL_STATE_DIR:-$STATE_DIR/jool-runtime}"
 SERVICE_NAME="nftables"
 REAL_NFT_CMD="${REAL_NFT_CMD:-}"
 APPLY_RESULT=""
 CONFIG_AUTO_REBUILT=0
-CONFIG_RENDER_VERSION="4"
+CONFIG_RENDER_VERSION="5"
 TRACK_TIMEOUT="${TRACK_TIMEOUT:-30m}"
 IPV6_ROUTE_MARK="${IPV6_ROUTE_MARK:-100}"
 IPV6_ROUTE_TABLE="${IPV6_ROUTE_TABLE:-100}"
@@ -88,6 +90,21 @@ nft_run() {
     "$REAL_NFT_CMD" "$@"
 }
 
+with_state_lock() {
+    local fd rc
+    if [[ "${NFTPF_STATE_LOCK_HELD:-0}" == "1" ]]; then "$@"; return $?; fi
+    command -v flock >/dev/null || { echo '错误：缺少 flock，请安装 util-linux。' >&2; return 1; }
+    mkdir -p "$STATE_DIR" || return 1
+    exec {fd}>"$STATE_DIR/.mutation.lock" || return 1
+    if ! chmod 600 "$STATE_DIR/.mutation.lock"; then exec {fd}>&-; return 1; fi
+    if ! flock -x "$fd"; then exec {fd}>&-; return 1; fi
+    local NFTPF_STATE_LOCK_HELD=1
+    if "$@"; then rc=0; else rc=$?; fi
+    flock -u "$fd"
+    exec {fd}>&-
+    return "$rc"
+}
+
 managed_table_specs() {
     cat <<'EOF'
 ip nftpf_track
@@ -95,6 +112,7 @@ ip6 nftpf_track
 ip nftpf_access
 ip6 nftpf_access
 inet nftpf_route
+inet nftpf_jool_guard
 ip6 nftpf_routefix
 ip nftpf_nat
 ip6 nftpf_nat
@@ -148,7 +166,8 @@ managed_rules_are_loaded() {
         { [[ "$MIGRATE_LEGACY_NAT" == "1" ]] && nft_run list chain ip nat prerouting >/dev/null 2>&1; }
 }
 
-unload_managed_rules() {
+unload_managed_rules() { with_state_lock unload_managed_rules_unlocked "$@"; }
+unload_managed_rules_unlocked() {
     local transaction
 
     transaction=$(mktemp) || return 1
@@ -743,10 +762,12 @@ join_rule() {
 
 read_rule_fields() {
     local line=$1
-    IFS='|' read -r R_ID R_FAMILY R_LISTEN_IP R_LISTEN_START R_LISTEN_END R_TARGET_TYPE R_TARGET_HOST R_RESOLVED_IP R_TARGET_START R_TARGET_END R_MODE R_PROTOCOL R_LINE_ID R_ROUTE_MODE R_NOTE <<< "$line"
+    IFS='|' read -r R_ID R_FAMILY R_LISTEN_IP R_LISTEN_START R_LISTEN_END R_TARGET_TYPE R_TARGET_HOST R_RESOLVED_IP R_TARGET_START R_TARGET_END R_MODE R_PROTOCOL R_LINE_ID R_ROUTE_MODE R_NOTE R_TARGET_FAMILY <<< "$line"
     R_LINE_ID=${R_LINE_ID:-}
     R_ROUTE_MODE=${R_ROUTE_MODE:-none}
     R_NOTE=${R_NOTE:-}
+    # Append-only schema: old 14/15-field records continue to work.
+    R_TARGET_FAMILY=${R_TARGET_FAMILY:-$(classify_host "$R_RESOLVED_IP")}
     case "$R_ROUTE_MODE" in
         none|iifonly|managed) ;;
         *) R_ROUTE_MODE="none" ;;
@@ -1049,7 +1070,6 @@ choose_rule_family() {
     local listen_family
     local target_kind
 
-    listen_ip=$(normalize_listen_ip "$listen_ip")
     target_kind=$(classify_host "$target_host")
 
     if [[ -n "$listen_ip" ]]; then
@@ -1060,15 +1080,15 @@ choose_rule_family() {
         fi
     fi
 
-    case "$family_choice" in
-        4|ipv4|IPv4) echo "ipv4"; return 0 ;;
-        6|ipv6|IPv6) echo "ipv6"; return 0 ;;
-    esac
-
     if [[ -n "$listen_family" ]]; then
         echo "$listen_family"
         return 0
     fi
+
+    case "$family_choice" in
+        4|ipv4|IPv4) echo "ipv4"; return 0 ;;
+        6|ipv6|IPv6) echo "ipv6"; return 0 ;;
+    esac
 
     case "$target_kind" in
         ipv4) echo "ipv4" ;;
@@ -1134,15 +1154,7 @@ validate_family_compatibility() {
     fi
 
     target_kind=$(classify_host "$target_host")
-    if [[ "$target_kind" == "ipv4" && "$family" != "ipv4" ]]; then
-        echo -e "${RED}错误：IPv4 目标不能写入 IPv6 规则。${PLAIN}"
-        return 1
-    fi
-
-    if [[ "$target_kind" == "ipv6" && "$family" != "ipv6" ]]; then
-        echo -e "${RED}错误：IPv6 目标不能写入 IPv4 规则。${PLAIN}"
-        return 1
-    fi
+    [[ "$target_kind" != "invalid" ]]
 }
 
 build_port_map() {
@@ -1188,6 +1200,16 @@ build_nft_rule_from_fields() {
     local port_expr
     local dnat_target
     local map_str
+    local dnat_ip="$R_RESOLVED_IP"
+
+    if rule_uses_jool; then
+        jool_addresses "$R_ID" || return 1
+        if [[ "$R_FAMILY" == "ipv6" ]]; then
+            dnat_ip=$(jool_synthesize_ipv4 "$R_RESOLVED_IP") || return 1
+        else
+            dnat_ip="$J_NS4"
+        fi
+    fi
 
     line_match=$(line_match_from_current)
 
@@ -1207,13 +1229,13 @@ build_nft_rule_from_fields() {
 
     case "$R_MODE" in
         single)
-            dnat_target=$(build_dnat_target "$R_FAMILY" "$R_RESOLVED_IP" "$R_TARGET_START")
+            dnat_target=$(build_dnat_target "$R_FAMILY" "$dnat_ip" "$R_TARGET_START")
             ;;
         range_1_to_1)
-            dnat_target=$(build_dnat_target "$R_FAMILY" "$R_RESOLVED_IP" "")
+            dnat_target=$(build_dnat_target "$R_FAMILY" "$dnat_ip" "")
             ;;
         range_offset)
-            dnat_target=$(build_dnat_target "$R_FAMILY" "$R_RESOLVED_IP" "")
+            dnat_target=$(build_dnat_target "$R_FAMILY" "$dnat_ip" "")
             map_str=$(build_port_map "$R_LISTEN_START" "$R_LISTEN_END" "$R_TARGET_START")
             echo "        ${line_match}${listen_match}meta l4proto {tcp, udp} th dport $port_expr dnat to $dnat_target : th dport map $map_str"
             return
@@ -1224,6 +1246,471 @@ build_nft_rule_from_fields() {
     esac
 
     echo "        ${line_match}${listen_match}meta l4proto {tcp, udp} th dport $port_expr dnat to $dnat_target"
+}
+
+# -----------------------------------------------------------------------------
+# Cross-family forwarding: private, per-rule Stateful NAT64 namespaces
+# -----------------------------------------------------------------------------
+
+rule_uses_jool() {
+    [[ "$R_FAMILY" != "$R_TARGET_FAMILY" &&
+        ( "$R_FAMILY" == "ipv4" || "$R_FAMILY" == "ipv6" ) &&
+        ( "$R_TARGET_FAMILY" == "ipv4" || "$R_TARGET_FAMILY" == "ipv6" ) ]]
+}
+
+rules_file_uses_jool() {
+    local record
+    while IFS= read -r record; do
+        [[ -z "$record" || "$record" == \#* ]] && continue
+        read_rule_fields "$record"
+        rule_uses_jool && return 0
+    done < "$1"
+    return 1
+}
+
+jool_addresses() {
+    local id=$1 offset second third fourth hex
+    if [[ ! "$id" =~ ^[1-9][0-9]{0,4}$ ]] || (( id > 32767 )); then
+        echo '错误：Jool 规则 ID 必须在 1-32767 之间。' >&2
+        return 1
+    fi
+    offset=$((id * 4))
+    second=$((18 + offset / 65536))
+    third=$((offset / 256 % 256))
+    fourth=$((offset % 256))
+    hex=$(printf '%x' "$id")
+    J_NAME="nftpf-jool-$id"
+    J_VETH="npj$id"
+    J_NET4="198.$second.$third.$fourth/30"
+    J_HOST4="198.$second.$third.$((fourth + 1))"
+    J_NS4="198.$second.$third.$((fourth + 2))"
+    J_HOST6="fd64:6e66:7471:$hex::1"
+    J_NS6="fd64:6e66:7471:$hex::2"
+    J_POOL6="fd64:6e66:7470:$hex::/96"
+}
+
+jool_synthesize_ipv4() {
+    local a b c d
+    is_valid_ipv4 "$1" || return 1
+    IFS=. read -r a b c d <<< "$1"
+    printf '%s%x:%x\n' "${J_POOL6%::/96}::" "$((10#$a * 256 + 10#$b))" "$((10#$c * 256 + 10#$d))"
+}
+
+render_jool_egress_snat() {
+    local rules_file=$1 family=$2 record source addr
+    while IFS= read -r record; do
+        [[ -z "$record" || "$record" == \#* ]] && continue
+        read_rule_fields "$record"
+        rule_uses_jool || continue
+        [[ "$R_TARGET_FAMILY" == "$family" ]] || continue
+        jool_addresses "$R_ID" || return 1
+        if [[ "$family" == "ipv4" ]]; then
+            source="$J_NS4"; addr=ip
+        else
+            source=$(jool_synthesize_ipv4 "$J_HOST4") || return 1
+            addr=ip6
+        fi
+        echo "        iifname \"$J_VETH\" $addr saddr $source $addr daddr $R_RESOLVED_IP meta l4proto {tcp, udp} th dport $R_TARGET_START-$R_TARGET_END masquerade"
+    done < "$rules_file"
+}
+
+render_jool_guard() {
+    local rules_file=$1 record addr target mask original line_match
+    rules_file_uses_jool "$rules_file" || return 0
+    cat <<'EOF'
+table inet nftpf_jool_guard {
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+EOF
+    while IFS= read -r record; do
+        [[ -z "$record" || "$record" == \#* ]] && continue
+        read_rule_fields "$record"
+        rule_uses_jool || continue
+        jool_addresses "$R_ID" || return 1
+        line_match=$(line_match_from_current)
+        if [[ "$R_FAMILY" == "ipv6" ]]; then
+            addr=ip6
+            target=$(jool_synthesize_ipv4 "$R_RESOLVED_IP") || return 1
+        else
+            addr=ip; target="$J_NS4"
+        fi
+        original=""
+        [[ -z "$R_LISTEN_IP" ]] || original="ct original $addr daddr $R_LISTEN_IP "
+        echo "        oifname \"$J_VETH\" ct state {established, related} accept"
+        echo "        iifname \"$J_VETH\" ct state {established, related} accept"
+        echo "        ${line_match}oifname \"$J_VETH\" ct status dnat ${original}ct original proto-dst $R_LISTEN_START-$R_LISTEN_END $addr daddr $target meta l4proto {tcp, udp} th dport $R_TARGET_START-$R_TARGET_END accept"
+        if [[ "$R_TARGET_FAMILY" == "ipv4" ]]; then
+            addr=ip; mask="$J_NS4"
+        else
+            addr=ip6; mask=$(jool_synthesize_ipv4 "$J_HOST4") || return 1
+        fi
+        echo "        iifname \"$J_VETH\" $addr saddr $mask $addr daddr $R_RESOLVED_IP meta l4proto {tcp, udp} th dport $R_TARGET_START-$R_TARGET_END accept"
+        echo "        oifname \"$J_VETH\" drop"
+        echo "        iifname \"$J_VETH\" drop"
+    done < "$rules_file"
+    printf '    }\n}\n\n'
+}
+
+jool_validate_rules() {
+    local record actual seen='|'
+    while IFS= read -r record; do
+        [[ -z "$record" || "$record" == \#* ]] && continue
+        read_rule_fields "$record"
+        actual=$(classify_host "$R_RESOLVED_IP")
+        [[ "$R_FAMILY" == "ipv4" || "$R_FAMILY" == "ipv6" ]] || return 1
+        [[ "$actual" == "ipv4" || "$actual" == "ipv6" ]] || return 1
+        [[ "$actual" == "$R_TARGET_FAMILY" ]] || { echo '错误：目标协议族与解析地址不一致。' >&2; return 1; }
+        if [[ -n "$R_LISTEN_IP" && "$(classify_host "$R_LISTEN_IP")" != "$R_FAMILY" ]]; then
+            echo '错误：监听地址与入口协议族不一致。' >&2; return 1
+        fi
+        rule_uses_jool || continue
+        jool_addresses "$R_ID" || return 1
+        [[ "$seen" != *"|$R_ID|"* ]] || { echo '错误：重复的 Jool 规则 ID。' >&2; return 1; }
+        seen="$seen$R_ID|"
+        validate_port_range "$R_LISTEN_START" "$R_LISTEN_END" '入口' || return 1
+        validate_port_range "$R_TARGET_START" "$R_TARGET_END" '目标' || return 1
+        [[ "$R_PROTOCOL" == "tcp_udp" &&
+            "$((R_LISTEN_END - R_LISTEN_START))" -eq "$((R_TARGET_END - R_TARGET_START))" ]] || return 1
+        case "$R_MODE" in single|range_1_to_1|range_offset) ;; *) return 1 ;; esac
+    done < "$1"
+}
+
+jool_check_dependencies() {
+    local cmd
+    for cmd in ip jool modprobe sysctl stat; do
+        command -v "$cmd" >/dev/null || { echo "错误：缺少 $cmd；运行 nftpf --install-jool 安装 Jool 依赖。" >&2; return 1; }
+    done
+    modprobe jool || { echo '错误：无法加载 jool；检查当前内核 headers、DKMS 和模块版本。' >&2; return 1; }
+}
+
+install_jool_dependencies() {
+    command -v apt-get >/dev/null || { echo '请手动安装匹配内核的 Jool 4.x 模块及 jool-tools。' >&2; return 1; }
+    apt-get update && apt-get install -y "linux-headers-$(uname -r)" dkms jool-dkms jool-tools || return 1
+    jool_check_dependencies
+}
+
+jool_namespace_exists() {
+    ip netns list | awk '{print $1}' | grep -Fxq "$J_NAME"
+}
+
+jool_namespace_owned() {
+    [[ -f "$JOOL_STATE_DIR/$R_ID.inode" && -e "/run/netns/$J_NAME" ]] &&
+        [[ "$(stat -Lc '%d:%i' "/run/netns/$J_NAME")" == "$(cat "$JOOL_STATE_DIR/$R_ID.inode")" ]]
+}
+
+jool_link_owned() {
+    ip -d link show dev "$J_VETH" 2>/dev/null | grep -Fq "alias nftpf-jool-$R_ID"
+}
+
+jool_preflight_record() {
+    local routes
+    jool_addresses "$R_ID" || return 1
+    if jool_namespace_exists && ! jool_namespace_owned; then
+        echo "错误：$J_NAME 已存在且不属于本工具，未修改。" >&2; return 1
+    fi
+    if ip link show dev "$J_VETH" >/dev/null 2>&1 && ! jool_link_owned; then
+        echo "错误：$J_VETH 已存在且不属于本工具，未修改。" >&2; return 1
+    fi
+    routes=$(ip -4 route show table all match "$J_NET4"; ip -6 route show table all match "$J_POOL6")
+    if printf '%s\n' "$routes" | grep -vE "^(default|$)| dev $J_VETH( |$)" | grep -q .; then
+        echo "错误：Jool 私网 $J_NET4 / $J_POOL6 与现有路由冲突，未修改。" >&2; return 1
+    fi
+}
+
+jool_delete_record() {
+    local id=$1
+    [[ -f "$JOOL_STATE_DIR/$id.rule" ]] || return 0
+    read_rule_fields "$(cat "$JOOL_STATE_DIR/$id.rule")"
+    jool_addresses "$R_ID" || return 1
+    # Never remove somebody else's namespace/interface, even after a stale state file.
+    if jool_namespace_exists && ! jool_namespace_owned; then
+        echo "错误：拒绝删除非托管命名空间 $J_NAME。" >&2; return 1
+    fi
+    if jool_namespace_owned && ip netns exec "$J_NAME" jool -i nftpf global display >/dev/null 2>&1; then
+        ip netns exec "$J_NAME" jool instance remove nftpf || return 1
+    fi
+    if ip link show dev "$J_VETH" >/dev/null 2>&1; then
+        jool_link_owned || return 1
+        ip link del dev "$J_VETH" || return 1
+    fi
+    if jool_namespace_exists; then
+        ip netns del "$J_NAME" || return 1
+    fi
+    rm -f -- "$JOOL_STATE_DIR/$id.rule" "$JOOL_STATE_DIR/$id.inode"
+}
+
+jool_runtime_key() {
+    read_rule_fields "$1"
+    join_rule "$R_ID" "$R_FAMILY" "$R_RESOLVED_IP" "$R_TARGET_START" "$R_TARGET_END" "$R_LINE_ID" "$R_ROUTE_MODE"
+}
+
+jool_set_root_routes() {
+    local table family dest
+    ip -6 route replace "$J_POOL6" via "$J_NS6" dev "$J_VETH" || return 1
+    if [[ "$R_ROUTE_MODE" == "managed" && -n "$R_LINE_ID" ]]; then
+        find_line_by_id "$R_LINE_ID" || return 1
+        read_line_fields "$FOUND_LINE"
+        if [[ "$R_FAMILY" == "ipv6" ]]; then
+            family=6; table="$L_TABLE6"; dest="$J_POOL6"
+            [[ -n "$table" ]] || return 1
+            ip -6 route replace "$dest" via "$J_NS6" dev "$J_VETH" onlink table "$table" || return 1
+        else
+            family=4; table="$L_TABLE4"; dest="$J_NS4/32"
+            [[ -n "$table" ]] || return 1
+            ip -4 route replace "$dest" dev "$J_VETH" table "$table" || return 1
+        fi
+    fi
+}
+
+jool_ensure_record() {
+    local record=$1 saved_key new_key protocol port ports
+    read_rule_fields "$record"
+    jool_addresses "$R_ID" || return 1
+    jool_preflight_record || return 1
+    new_key=$(jool_runtime_key "$record")
+    if [[ -f "$JOOL_STATE_DIR/$R_ID.rule" ]]; then
+        saved_key=$(jool_runtime_key "$(cat "$JOOL_STATE_DIR/$R_ID.rule")")
+        if [[ "$saved_key" == "$new_key" ]] && jool_namespace_owned && jool_link_owned &&
+            ip netns exec "$J_NAME" jool -i nftpf global display >/dev/null 2>&1; then
+            printf '%s\n' "$record" > "$JOOL_STATE_DIR/$R_ID.rule"
+            jool_set_root_routes
+            return $?
+        fi
+        jool_delete_record "$R_ID" || return 1
+        read_rule_fields "$record"
+        jool_addresses "$R_ID" || return 1
+    fi
+    printf '%s\n' "$record" > "$JOOL_STATE_DIR/$R_ID.rule" || return 1
+    if ! ip netns add "$J_NAME"; then rm -f -- "$JOOL_STATE_DIR/$R_ID.rule"; return 1; fi
+    if ! stat -Lc '%d:%i' "/run/netns/$J_NAME" > "$JOOL_STATE_DIR/$R_ID.inode"; then
+        ip netns del "$J_NAME"
+        rm -f -- "$JOOL_STATE_DIR/$R_ID.rule" "$JOOL_STATE_DIR/$R_ID.inode"
+        return 1
+    fi
+    ip link add "$J_VETH" type veth peer name nftpf0 netns "$J_NAME" || return 1
+    if ! ip link set "$J_VETH" alias "nftpf-jool-$R_ID"; then
+        ip link del dev "$J_VETH"
+        return 1
+    fi
+    ip addr add "$J_HOST4/30" dev "$J_VETH" || return 1
+    ip -6 addr add "$J_HOST6/64" dev "$J_VETH" nodad || return 1
+    ip link set "$J_VETH" up || return 1
+    ip netns exec "$J_NAME" ip link set lo up || return 1
+    ip netns exec "$J_NAME" ip addr add "$J_NS4/30" dev nftpf0 || return 1
+    ip netns exec "$J_NAME" ip -6 addr add "$J_NS6/64" dev nftpf0 nodad || return 1
+    ip netns exec "$J_NAME" ip link set nftpf0 up || return 1
+    ip netns exec "$J_NAME" sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.nftpf0.rp_filter=0 || return 1
+    ip netns exec "$J_NAME" ip -4 route add default via "$J_HOST4" || return 1
+    ip netns exec "$J_NAME" ip -6 route add default via "$J_HOST6" || return 1
+    # Marks used for physical return routing must not select Jool's pool4.
+    ip netns exec "$J_NAME" nft -f - <<'EOF' || return 1
+table inet nftpf_jool {
+    chain marks {
+        type filter hook prerouting priority -310; policy accept;
+        meta mark set 0
+    }
+}
+EOF
+    ip netns exec "$J_NAME" jool instance add nftpf --netfilter --pool6 "$J_POOL6" || return 1
+    ports=61001-65535
+    if [[ "$R_FAMILY" == "ipv4" ]]; then ports="$R_TARGET_START-$R_TARGET_END"; fi
+    for protocol in tcp udp; do
+        ip netns exec "$J_NAME" jool -i nftpf pool4 add "--$protocol" "$J_NS4" "$ports" || return 1
+        if [[ "$R_FAMILY" == "ipv4" ]]; then
+            for ((port=R_TARGET_START; port<=R_TARGET_END; port++)); do
+                ip netns exec "$J_NAME" jool -i nftpf bib add "--$protocol" "$J_NS4#$port" "$R_RESOLVED_IP#$port" || return 1
+            done
+        fi
+    done
+    if [[ "$R_FAMILY" == "ipv4" ]]; then
+        ip netns exec "$J_NAME" jool -i nftpf global update drop-externally-initiated-tcp false || return 1
+        ip netns exec "$J_NAME" jool -i nftpf global update address-dependent-filtering false || return 1
+    fi
+    jool_set_root_routes
+}
+
+jool_snapshot_runtime() {
+    local file
+    JOOL_ROLLBACK_DIR=$(mktemp -d) || return 1
+    for file in "$JOOL_STATE_DIR"/*.rule; do
+        [[ -f "$file" ]] || continue
+        cp "$file" "$JOOL_ROLLBACK_DIR/" || return 1
+    done
+    if [[ "${NFTPF_JOOL_SKIP_SYSTEMD:-0}" != "1" ]]; then
+        [[ ! -f "$JOOL_SERVICE_FILE" ]] || cp "$JOOL_SERVICE_FILE" "$JOOL_ROLLBACK_DIR/service.before" || return 1
+        if systemctl is-enabled --quiet nftpf-jool.service 2>/dev/null; then
+            echo 1 > "$JOOL_ROLLBACK_DIR/service.enabled"
+        else
+            echo 0 > "$JOOL_ROLLBACK_DIR/service.enabled"
+        fi
+    fi
+    return 0
+}
+
+jool_restore_runtime() {
+    local file record id failed=0
+    [[ -n "${JOOL_ROLLBACK_DIR:-}" && -d "$JOOL_ROLLBACK_DIR" ]] || return 0
+    if [[ "${NFTPF_JOOL_SKIP_SYSTEMD:-0}" != "1" ]]; then
+        if [[ -f "$JOOL_ROLLBACK_DIR/service.before" ]]; then
+            cp "$JOOL_ROLLBACK_DIR/service.before" "$JOOL_SERVICE_FILE" || failed=1
+        else
+            rm -f -- "$JOOL_SERVICE_FILE"
+        fi
+        systemctl daemon-reload || failed=1
+        if [[ "$(cat "$JOOL_ROLLBACK_DIR/service.enabled" 2>/dev/null)" == "1" ]]; then
+            systemctl enable nftpf-jool.service >/dev/null 2>&1 || failed=1
+        else
+            systemctl disable nftpf-jool.service >/dev/null 2>&1 || true
+        fi
+    fi
+    for file in "$JOOL_STATE_DIR"/*.rule; do
+        [[ -f "$file" ]] || continue
+        id=${file##*/}; id=${id%.rule}
+        if [[ ! -f "$JOOL_ROLLBACK_DIR/$id.rule" ]]; then jool_delete_record "$id" || failed=1; fi
+    done
+    for file in "$JOOL_ROLLBACK_DIR"/*.rule; do
+        [[ -f "$file" ]] || continue
+        record=$(cat "$file")
+        jool_ensure_record "$record" || failed=1
+    done
+    rm -rf -- "$JOOL_ROLLBACK_DIR"
+    JOOL_ROLLBACK_DIR=''
+    [[ "$failed" -eq 0 ]] || echo '错误：部分 Jool 资源回滚失败，请检查 nftpf --jool-status。' >&2
+    return "$failed"
+}
+
+jool_prepare_runtime() {
+    local rules_file=$1 record
+    jool_validate_rules "$rules_file" || return 1
+    if rules_file_uses_jool "$rules_file"; then jool_check_dependencies || return 1; fi
+    mkdir -p "$JOOL_STATE_DIR" || return 1
+    chmod 700 "$JOOL_STATE_DIR" || return 1
+    if ! jool_snapshot_runtime; then
+        [[ -z "${JOOL_ROLLBACK_DIR:-}" ]] || rm -rf -- "$JOOL_ROLLBACK_DIR"
+        JOOL_ROLLBACK_DIR=''
+        return 1
+    fi
+    while IFS= read -r record; do
+        [[ -z "$record" || "$record" == \#* ]] && continue
+        read_rule_fields "$record"
+        rule_uses_jool || continue
+        if ! jool_ensure_record "$record"; then jool_restore_runtime; return 1; fi
+    done < "$rules_file"
+    if ! jool_prune_runtime "$rules_file"; then jool_restore_runtime; return 1; fi
+}
+
+jool_prune_runtime() {
+    local rules_file=$1 file id record keep='|'
+    while IFS= read -r record; do
+        [[ -z "$record" || "$record" == \#* ]] && continue
+        read_rule_fields "$record"
+        rule_uses_jool && keep="$keep$R_ID|"
+    done < "$rules_file"
+    for file in "$JOOL_STATE_DIR"/*.rule; do
+        [[ -f "$file" ]] || continue
+        id=${file##*/}; id=${id%.rule}
+        if [[ "$keep" != *"|$id|"* ]]; then jool_delete_record "$id" || return 1; fi
+    done
+}
+
+jool_finalize_runtime() {
+    [[ -z "${JOOL_ROLLBACK_DIR:-}" ]] || rm -rf -- "$JOOL_ROLLBACK_DIR"
+    JOOL_ROLLBACK_DIR=''
+}
+
+stop_jool_runtime() { with_state_lock stop_jool_runtime_unlocked "$@"; }
+stop_jool_runtime_unlocked() {
+    local file id failed=0
+    for file in "$JOOL_STATE_DIR"/*.rule; do
+        [[ -f "$file" ]] || continue
+        id=${file##*/}; id=${id%.rule}
+        jool_delete_record "$id" || failed=1
+    done
+    return "$failed"
+}
+
+install_jool_service() {
+    local path
+    [[ "${NFTPF_JOOL_SKIP_SYSTEMD:-0}" == "1" ]] && return 0
+    if ! rules_file_uses_jool "$RULES_FILE"; then
+        [[ -f "$JOOL_SERVICE_FILE" ]] || return 0
+        systemctl disable nftpf-jool.service >/dev/null 2>&1 || return 1
+        rm -f -- "$JOOL_SERVICE_FILE"
+        systemctl daemon-reload
+        return $?
+    fi
+    path=$(realpath "$SHORTCUT_PATH" 2>/dev/null || true)
+    [[ -x "$path" ]] || path=$(realpath "${BASH_SOURCE[0]}")
+    cat > "$JOOL_SERVICE_FILE" <<EOF
+[Unit]
+Description=nftpf cross-family Jool translators
+After=network-online.target nftables.service nftpf-route.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=$(systemd_quote_arg "STATE_DIR=$STATE_DIR") $(systemd_quote_arg "RULES_FILE=$RULES_FILE") $(systemd_quote_arg "LINES_FILE=$LINES_FILE") $(systemd_quote_arg "JOOL_STATE_DIR=$JOOL_STATE_DIR")
+ExecStart=$(systemd_quote_arg "$path") --apply-jool
+ExecStop=$(systemd_quote_arg "$path") --stop-jool
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload && systemctl enable nftpf-jool.service >/dev/null 2>&1
+}
+
+apply_jool_runtime() { with_state_lock apply_jool_runtime_unlocked "$@"; }
+apply_jool_runtime_unlocked() {
+    jool_prepare_runtime "$RULES_FILE" || return 1
+    jool_finalize_runtime "$RULES_FILE"
+}
+
+apply_jool_routes() {
+    local file
+    for file in "$JOOL_STATE_DIR"/*.rule; do
+        [[ -f "$file" ]] || continue
+        read_rule_fields "$(cat "$file")"
+        jool_addresses "$R_ID" || return 1
+        # At boot the route unit can run before Jool recreates /run/netns.
+        jool_namespace_exists || continue
+        jool_namespace_owned && jool_link_owned || return 1
+        jool_set_root_routes || return 1
+    done
+}
+
+jool_management_menu() {
+    echo '1. 安装 Jool（当前内核 headers / DKMS / 工具）'
+    echo '2. 查看 Jool 状态'
+    echo '0. 返回'
+    local selection
+    read -r -p '请选择: ' selection
+    case "$selection" in
+        1) install_jool_dependencies ;;
+        2) show_jool_status ;;
+    esac
+    pause_and_return
+}
+
+show_jool_status() {
+    local record count=0 failed=0
+    echo "Jool: $(jool --version 2>/dev/null || echo '未安装')"
+    while IFS= read -r record; do
+        [[ -z "$record" || "$record" == \#* ]] && continue
+        read_rule_fields "$record"
+        rule_uses_jool || continue
+        jool_addresses "$R_ID" || return 1
+        echo "[$R_ID] $R_FAMILY → $R_TARGET_FAMILY / $J_NAME"
+        if jool_namespace_owned && jool_link_owned && ip netns exec "$J_NAME" jool -i nftpf global display >/dev/null 2>&1; then
+            echo '  就绪'
+        else
+            echo '  未就绪：请运行 nftpf --apply-jool 或检查模块/路由。'
+            failed=1
+        fi
+        count=$((count + 1))
+    done < "$RULES_FILE"
+    echo "Jool 规则: $count"
+    return "$failed"
 }
 
 parse_dnat_target() {
@@ -1627,6 +2114,8 @@ generate_config_from_rules() {
     local rules_file=$1
     local mark_hex
 
+    jool_validate_rules "$rules_file" || return 1
+
     mark_hex=$(printf '0x%08x' "$IPV6_ROUTE_MARK")
 
 cat <<EOF
@@ -1637,6 +2126,7 @@ EOF
     render_tracking_tables "$rules_file"
     render_access_tables "$rules_file"
     render_route_mark_table "$rules_file"
+    render_jool_guard "$rules_file" || return 1
     cat <<EOF
 table ip nftpf_nat {
     chain prerouting {
@@ -1651,6 +2141,9 @@ EOF
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
         ct status dnat masquerade
+EOF
+    render_jool_egress_snat "$rules_file" "ipv4" || return 1
+    cat <<EOF
     }
 }
 
@@ -1667,6 +2160,9 @@ EOF
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
         ct status dnat masquerade
+EOF
+    render_jool_egress_snat "$rules_file" "ipv6" || return 1
+    cat <<EOF
     }
 }
 EOF
@@ -1789,7 +2285,8 @@ validate_nft_config() {
     return "$rc"
 }
 
-apply_config_changes() {
+apply_config_changes() { with_state_lock apply_config_changes_unlocked "$@"; }
+apply_config_changes_unlocked() {
     local transaction
     local service_was_enabled=0
     APPLY_RESULT=""
@@ -1829,13 +2326,32 @@ apply_config_changes() {
         return 1
     fi
 
+    if ! jool_prepare_runtime "$RULES_FILE"; then
+        rm -f "$transaction"
+        [ "$service_was_enabled" -eq 1 ] || systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        echo -e "${RED}错误：Jool 路径准备失败，nftables 实时规则未修改。${PLAIN}"
+        return 1
+    fi
+
+    if ! install_jool_service; then
+        jool_restore_runtime || true
+        rm -f "$transaction"
+        [ "$service_was_enabled" -eq 1 ] || systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        echo -e "${RED}错误：Jool 开机恢复服务安装失败，实时 nftables 规则未修改。${PLAIN}"
+        return 1
+    fi
+
     if nft_run -f "$transaction"; then
         rm -f "$transaction"
+        if ! jool_finalize_runtime "$RULES_FILE"; then
+            echo -e "${YELLOW}规则已应用，但旧 Jool 资源清理失败，请检查 --jool-status。${PLAIN}"
+        fi
         APPLY_RESULT="applied_enabled"
         return 0
     fi
 
     rm -f "$transaction"
+    jool_restore_runtime || true
     if [ "$service_was_enabled" -eq 0 ]; then
         systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
     fi
@@ -1851,7 +2367,8 @@ show_apply_result() {
     esac
 }
 
-commit_rules_file() {
+commit_rules_file() { with_state_lock commit_rules_file_unlocked "$@"; }
+commit_rules_file_unlocked() {
     local tmp_rules=$1
     local rollback_dir
     local had_rules=0
@@ -1905,7 +2422,8 @@ commit_rules_file() {
     fi
 }
 
-append_rule_record() {
+append_rule_record() { with_state_lock append_rule_record_unlocked "$@"; }
+append_rule_record_unlocked() {
     local record=$1
     local tmp_rules
 
@@ -1915,7 +2433,8 @@ append_rule_record() {
     commit_rules_file "$tmp_rules"
 }
 
-update_rule_record() {
+update_rule_record() { with_state_lock update_rule_record_unlocked "$@"; }
+update_rule_record_unlocked() {
     local target_id=$1
     local record=$2
     local tmp_rules
@@ -1944,7 +2463,8 @@ update_rule_record() {
     commit_rules_file "$tmp_rules"
 }
 
-delete_rule_record() {
+delete_rule_record() { with_state_lock delete_rule_record_unlocked "$@"; }
+delete_rule_record_unlocked() {
     local target_id=$1
     local tmp_rules
     local line
@@ -1979,20 +2499,34 @@ collect_target_family() {
     local target_host=$1
     local listen_ip=$2
     local default_family=$3
+    local target_default=${4:-auto}
     local target_kind
     local choice
 
     target_kind=$(classify_host "$target_host")
 
+    CHOSEN_FAMILY=$(choose_rule_family "$listen_ip" "$target_host" "$default_family") || return 1
+    CHOSEN_TARGET_FAMILY="$target_kind"
     if [[ "$target_kind" == "domain" ]]; then
-        read -p "目标域名解析类型 [auto/4/6] (默认 ${default_family:-auto}): " choice
-        choice=${choice:-${default_family:-auto}}
-    else
-        choice="${default_family:-auto}"
+        choice="$target_default"
+        if [[ "${NFT_HELPER_TEST_MODE:-0}" != "1" ]]; then
+            read -r -p "目标域名解析类型 [auto/4/6] (默认 $target_default): " choice
+            choice=${choice:-$target_default}
+        fi
+        case "$choice" in
+            4|ipv4|IPv4) CHOSEN_TARGET_FAMILY=ipv4 ;;
+            6|ipv6|IPv6) CHOSEN_TARGET_FAMILY=ipv6 ;;
+            auto)
+                CHOSEN_TARGET_FAMILY="$CHOSEN_FAMILY"
+                if ! resolve_domain "$target_host" "$CHOSEN_TARGET_FAMILY" >/dev/null; then
+                    if [[ "$CHOSEN_TARGET_FAMILY" == "ipv4" ]]; then CHOSEN_TARGET_FAMILY=ipv6; else CHOSEN_TARGET_FAMILY=ipv4; fi
+                fi
+                ;;
+            *) return 1 ;;
+        esac
     fi
-
-    CHOSEN_FAMILY=$(choose_rule_family "$listen_ip" "$target_host" "$choice") || return 1
-    [[ "$CHOSEN_FAMILY" == "ipv4" || "$CHOSEN_FAMILY" == "ipv6" ]]
+    [[ "$CHOSEN_FAMILY" == "ipv4" || "$CHOSEN_FAMILY" == "ipv6" ]] &&
+        [[ "$CHOSEN_TARGET_FAMILY" == "ipv4" || "$CHOSEN_TARGET_FAMILY" == "ipv6" ]]
 }
 
 prepare_rule_record() {
@@ -2008,8 +2542,8 @@ prepare_rule_record() {
     local line_id=${10:-}
     local route_mode=${11:-none}
     local note=${12:-}
+    local target_family_choice=${13:-auto}
 
-    listen_ip=$(normalize_listen_ip "$listen_ip")
     validate_rule_note "$note" || return 1
     case "$route_mode" in
         none|iifonly|managed) ;;
@@ -2030,14 +2564,15 @@ prepare_rule_record() {
         route_mode="none"
     fi
 
-    collect_target_family "$target_host" "$listen_ip" "$family_choice" || {
+    collect_target_family "$target_host" "$listen_ip" "$family_choice" "$target_family_choice" || {
         echo -e "${RED}错误：无法确定规则协议族，请检查监听地址或目标地址。${PLAIN}"
         return 1
     }
 
+    listen_ip=$(normalize_listen_ip "$listen_ip")
     validate_family_compatibility "$CHOSEN_FAMILY" "$listen_ip" "$target_host" || return 1
 
-    if ! resolve_target_for_rule "$target_host" "$CHOSEN_FAMILY"; then
+    if ! resolve_target_for_rule "$target_host" "$CHOSEN_TARGET_FAMILY"; then
         echo -e "${RED}错误：目标地址解析失败或协议族不匹配。${PLAIN}"
         return 1
     fi
@@ -2047,7 +2582,10 @@ prepare_rule_record() {
         return 1
     fi
 
-    PREPARED_RECORD=$(join_rule "$id" "$CHOSEN_FAMILY" "$listen_ip" "$listen_start" "$listen_end" "$RESOLVED_TARGET_TYPE" "$target_host" "$RESOLVED_TARGET_IP" "$target_start" "$target_end" "$mode" "tcp_udp" "$line_id" "$route_mode" "$note")
+    PREPARED_RECORD=$(join_rule "$id" "$CHOSEN_FAMILY" "$listen_ip" "$listen_start" "$listen_end" "$RESOLVED_TARGET_TYPE" "$target_host" "$RESOLVED_TARGET_IP" "$target_start" "$target_end" "$mode" "tcp_udp" "$line_id" "$route_mode" "$note" "$CHOSEN_TARGET_FAMILY")
+    if [[ "$CHOSEN_FAMILY" != "$CHOSEN_TARGET_FAMILY" ]]; then
+        jool_addresses "$id" || return 1
+    fi
 }
 
 lines_file_has_records() {
@@ -2115,7 +2653,7 @@ add_single_rule() {
     local note
 
     echo -e "${YELLOW}=== 添加端口转发规则 (TCP+UDP) ===${PLAIN}"
-    read -p "监听 IP (留空=自动匹配对应协议族所有地址): " listen_ip
+    read -p "监听 IP (留空=自动，0.0.0.0=IPv4 全部，::=IPv6 全部): " listen_ip
     read -p "监听端口: " listen_port
     validate_single_port "$listen_port" "监听端口" || { pause_and_return; return; }
 
@@ -2152,7 +2690,7 @@ add_range_rule() {
     local note
 
     echo -e "${YELLOW}=== 添加端口段转发规则 (TCP+UDP) ===${PLAIN}"
-    read -p "监听 IP (留空=自动匹配对应协议族所有地址): " listen_ip
+    read -p "监听 IP (留空=自动，0.0.0.0=IPv4 全部，::=IPv6 全部): " listen_ip
     read -p "监听起始端口: " listen_start
     read -p "监听结束端口: " listen_end
     validate_port_range "$listen_start" "$listen_end" "监听" || { pause_and_return; return; }
@@ -2201,6 +2739,9 @@ rule_summary_from_current() {
     local target_note=""
     local mode_text
     local line_text
+    local engine_text=""
+
+    rule_uses_jool && engine_text=" → $R_TARGET_FAMILY / Jool"
 
     if [ "$R_LISTEN_START" = "$R_LISTEN_END" ]; then
         listen_display=$(format_listen_display "$R_FAMILY" "$R_LISTEN_IP" "$R_LISTEN_START")
@@ -2229,7 +2770,7 @@ rule_summary_from_current() {
     if [ "$R_ROUTE_MODE" = "managed" ]; then
         line_text="${line_text}+route"
     fi
-    echo "[$R_ID] [$R_FAMILY] [$mode_text] [$line_text] $listen_display -> $target_display"
+    echo "[$R_ID] [$R_FAMILY$engine_text] [$mode_text] [$line_text] $listen_display -> $target_display"
     if [ -n "$R_NOTE" ]; then
         echo "[备注: $R_NOTE]"
     fi
@@ -2326,6 +2867,7 @@ quick_edit_rule() {
     local mode_choice
     local count
     local family_default
+    local target_family_default
     local line_id
     local route_mode
     local change_line
@@ -2344,6 +2886,7 @@ quick_edit_rule() {
     read_rule_fields "$FOUND_RULE"
 
     family_default="$R_FAMILY"
+    target_family_default="$R_TARGET_FAMILY"
     line_id="$R_LINE_ID"
     route_mode="$R_ROUTE_MODE"
     note="$R_NOTE"
@@ -2399,7 +2942,7 @@ quick_edit_rule() {
     note=$(read_note_with_default "$note")
     validate_rule_note "$note" || { pause_and_return; return; }
 
-    prepare_rule_record "$id" "$mode" "$listen_ip" "$listen_start" "$listen_end" "$target_host" "$target_start" "$target_end" "$family_default" "$line_id" "$route_mode" "$note" || { pause_and_return; return; }
+    prepare_rule_record "$id" "$mode" "$listen_ip" "$listen_start" "$listen_end" "$target_host" "$target_start" "$target_end" "$family_default" "$line_id" "$route_mode" "$note" "$target_family_default" || { pause_and_return; return; }
 
     if update_rule_record "$id" "$PREPARED_RECORD"; then
         echo -e "${GREEN}规则修改成功。${PLAIN}"
@@ -2477,7 +3020,8 @@ line_in_use() {
     return 1
 }
 
-commit_lines_file() {
+commit_lines_file() { with_state_lock commit_lines_file_unlocked "$@"; }
+commit_lines_file_unlocked() {
     local tmp_lines=$1
     local rollback_dir
     local had_lines=0
@@ -2709,7 +3253,8 @@ delete_line() {
     pause_and_line_menu
 }
 
-apply_managed_routes() {
+apply_managed_routes() { with_state_lock apply_managed_routes_unlocked "$@"; }
+apply_managed_routes_unlocked() {
     local line priority applied=0 failed=0
 
     command -v ip >/dev/null 2>&1 || { echo -e "${RED}错误：未找到 ip 命令。${PLAIN}"; return 1; }
@@ -2737,6 +3282,8 @@ apply_managed_routes() {
             fi
         fi
     done < "$LINES_FILE"
+
+    if ! apply_jool_routes; then failed=$((failed + 1)); fi
 
     if [ "$failed" -gt 0 ]; then
         echo -e "${RED}错误：$failed 条托管路由应用失败。${PLAIN}"
@@ -2812,7 +3359,8 @@ line_management_menu() {
     esac
 }
 
-refresh_ddns() {
+refresh_ddns() { with_state_lock refresh_ddns_unlocked "$@"; }
+refresh_ddns_unlocked() {
     local tmp_rules
     local line
     local new_ip
@@ -2834,7 +3382,7 @@ refresh_ddns() {
         if [ "$R_TARGET_TYPE" = "domain" ]; then
             domain_count=$((domain_count + 1))
             old_ip="$R_RESOLVED_IP"
-            if new_ip=$(resolve_domain "$R_TARGET_HOST" "$R_FAMILY"); then
+            if new_ip=$(resolve_domain "$R_TARGET_HOST" "$R_TARGET_FAMILY"); then
                 resolved_count=$((resolved_count + 1))
                 if [[ "$new_ip" != "$old_ip" ]]; then
                     echo -e "[$R_ID] $R_TARGET_HOST: ${YELLOW}$old_ip -> $new_ip${PLAIN}"
@@ -2848,7 +3396,7 @@ refresh_ddns() {
             fi
         fi
 
-        join_rule "$R_ID" "$R_FAMILY" "$R_LISTEN_IP" "$R_LISTEN_START" "$R_LISTEN_END" "$R_TARGET_TYPE" "$R_TARGET_HOST" "$R_RESOLVED_IP" "$R_TARGET_START" "$R_TARGET_END" "$R_MODE" "$R_PROTOCOL" "$R_LINE_ID" "$R_ROUTE_MODE" "$R_NOTE" >> "$tmp_rules"
+        join_rule "$R_ID" "$R_FAMILY" "$R_LISTEN_IP" "$R_LISTEN_START" "$R_LISTEN_END" "$R_TARGET_TYPE" "$R_TARGET_HOST" "$R_RESOLVED_IP" "$R_TARGET_START" "$R_TARGET_END" "$R_MODE" "$R_PROTOCOL" "$R_LINE_ID" "$R_ROUTE_MODE" "$R_NOTE" "$R_TARGET_FAMILY" >> "$tmp_rules"
     done < "$RULES_FILE"
 
     if [ "$changed" -eq 0 ]; then
@@ -3065,6 +3613,7 @@ manage_service() {
         disable) systemctl disable "$SERVICE_NAME" && echo -e "${GREEN}已取消开机自启。${PLAIN}" ;;
         stop)
             if unload_managed_rules; then
+                stop_jool_runtime || echo -e "${YELLOW}部分 Jool 资源清理失败，请检查状态。${PLAIN}"
                 echo -e "${GREEN}已卸载 nftpf 实时规则；未停止全局 nftables 服务，其他工具规则保持不变。${PLAIN}"
             else
                 echo -e "${RED}卸载 nftpf 实时规则失败。${PLAIN}"
@@ -3125,9 +3674,10 @@ cleanup_nftpf_units() {
         systemctl disable --now nftpf-ddns.timer >/dev/null 2>&1 || true
         systemctl disable --now nftpf-ddns.service >/dev/null 2>&1 || true
         systemctl disable --now nftpf-route.service >/dev/null 2>&1 || true
+        systemctl disable --now nftpf-jool.service >/dev/null 2>&1 || true
     fi
 
-    rm -f -- "$CRON_FILE" "$DDNS_SERVICE_FILE" "$DDNS_TIMER_FILE" "$ROUTE_SERVICE_FILE"
+    rm -f -- "$CRON_FILE" "$DDNS_SERVICE_FILE" "$DDNS_TIMER_FILE" "$ROUTE_SERVICE_FILE" "$JOOL_SERVICE_FILE"
 
     if command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload >/dev/null 2>&1 || true
@@ -3183,6 +3733,8 @@ clear_nftables_for_uninstall() {
         echo -e "${YELLOW}警告：未找到 nft 命令，无法立即卸载 nftpf 托管表。${PLAIN}"
     fi
 
+    stop_jool_runtime || echo -e "${YELLOW}警告：部分 Jool 资源清理失败，保留运行状态文件。${PLAIN}"
+
     if is_nftpf_managed_config || [ ! -f "$CONFIG_FILE" ]; then
         write_empty_uninstall_config || true
     else
@@ -3194,6 +3746,7 @@ cleanup_state_files_for_uninstall() {
     local delete_backups=$1
 
     rm -f -- "$RULES_FILE" "$LINES_FILE" "$ACCESS_FILE" "$ACCESS_HISTORY_FILE"
+    rmdir -- "$JOOL_STATE_DIR" 2>/dev/null || true
 
     if [[ "$delete_backups" == "1" ]]; then
         rm -rf -- "$BACKUP_DIR"
@@ -3635,7 +4188,8 @@ confirm_whitelist_family_coverage() {
     [[ "$confirm" == "y" || "$confirm" == "Y" ]]
 }
 
-commit_access_file() {
+commit_access_file() { with_state_lock commit_access_file_unlocked "$@"; }
+commit_access_file_unlocked() {
     local tmp_access=$1
     local rollback_dir
     local had_access=0
@@ -3820,7 +4374,8 @@ validate_backup_archive() {
     done <<< "$listing"
 }
 
-restore_backup_path() {
+restore_backup_path() { with_state_lock restore_backup_path_unlocked "$@"; }
+restore_backup_path_unlocked() {
     local backup_path=$1
     local tmp_dir
     local tmp_access
@@ -4029,7 +4584,7 @@ self_test() {
     fi
 
     generate_config_from_rules "$RULES_FILE" > "$tmp_config"
-    grep -q '^# NFTPF_RENDER_VERSION=4$' "$tmp_config" || { echo 'self-test: render version mismatch' >&2; rm -rf "$tmp_dir"; return 1; }
+    grep -q "^# NFTPF_RENDER_VERSION=$CONFIG_RENDER_VERSION\$" "$tmp_config" || { echo 'self-test: render version mismatch' >&2; rm -rf "$tmp_dir"; return 1; }
     grep -q '^table ip nftpf_nat {' "$tmp_config" || { echo 'self-test: IPv4 managed NAT table missing' >&2; rm -rf "$tmp_dir"; return 1; }
     grep -q '^table ip6 nftpf_nat {' "$tmp_config" || { echo 'self-test: IPv6 managed NAT table missing' >&2; rm -rf "$tmp_dir"; return 1; }
     if grep -q '^flush ruleset$' "$tmp_config"; then
@@ -4182,6 +4737,7 @@ main_menu() {
     echo -e "16. 线路管理（多网卡/多 DIA）"
     echo -e "17. 更新脚本"
     echo -e "18. 卸载脚本"
+    echo -e "19. Jool 跨协议族转发（安装/状态）"
     echo -e " 0. 退出脚本"
     echo -e "################################################"
     read -p "请输入数字: " choice
@@ -4205,6 +4761,7 @@ main_menu() {
         16) line_management_menu ;;
         17) update_script ;;
         18) uninstall_script ;;
+        19) jool_management_menu ;;
         0) echo -e "${GREEN}谢谢使用。${PLAIN}"; exit 0 ;;
         *) echo -e "${RED}请输入正确的数字。${PLAIN}"; sleep 1; main_menu ;;
     esac
@@ -4223,6 +4780,23 @@ run_cli() {
         --apply-routes)
             check_ddns_runtime || exit 1
             apply_managed_routes
+            exit $?
+            ;;
+        --install-jool)
+            install_jool_dependencies
+            exit $?
+            ;;
+        --apply-jool)
+            enable_ip_forward
+            apply_jool_runtime
+            exit $?
+            ;;
+        --stop-jool)
+            stop_jool_runtime
+            exit $?
+            ;;
+        --jool-status)
+            show_jool_status
             exit $?
             ;;
         --apply)
@@ -4257,6 +4831,10 @@ run_cli() {
             echo "  nftpf                  Open interactive forwarding menu"
             echo "  nftpf --refresh-ddns   Refresh DDNS/domain forwarding targets"
             echo "  nftpf --apply-routes   Apply managed multi-NIC policy routes"
+            echo "  nftpf --install-jool   Install Jool/DKMS for the running kernel (Debian/Ubuntu)"
+            echo "  nftpf --apply-jool     Restore managed cross-family translators and routes"
+            echo "  nftpf --stop-jool      Stop managed translators without unloading shared modules"
+            echo "  nftpf --jool-status    Show managed Jool translators"
             echo "  nftpf --apply          Validate, atomically apply, and persist nftpf rules"
             echo "  nftpf --self-test      Run local syntax and renderer checks"
             echo "  nftpf --update         Download and install latest nftpf script"
@@ -4271,6 +4849,10 @@ run_cli() {
             echo "  nftpf                  Open interactive forwarding menu"
             echo "  nftpf --refresh-ddns   Refresh DDNS/domain forwarding targets"
             echo "  nftpf --apply-routes   Apply managed multi-NIC policy routes"
+            echo "  nftpf --install-jool   Install Jool/DKMS for the running kernel (Debian/Ubuntu)"
+            echo "  nftpf --apply-jool     Restore managed cross-family translators and routes"
+            echo "  nftpf --stop-jool      Stop managed translators without unloading shared modules"
+            echo "  nftpf --jool-status    Show managed Jool translators"
             echo "  nftpf --apply          Validate, atomically apply, and persist nftpf rules"
             echo "  nftpf --self-test      Run local syntax and renderer checks"
             echo "  nftpf --update         Download and install latest nftpf script"

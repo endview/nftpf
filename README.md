@@ -10,6 +10,7 @@
 - Add port-range forwarding rules with 1:1 or offset mapping.
 - Add, edit, clear, and display an optional note for each forwarding rule.
 - Support IPv4, IPv6, and domain/DDNS targets.
+- Automatically use Jool Stateful NAT64 for IPv6-to-IPv4 and IPv4-to-IPv6 forwarding.
 - Validate the complete nftables transaction before changing live rules.
 - Atomically replace only `nftpf_*` tables without restarting the global nftables service.
 - Enable nftables at boot whenever rules are applied, while reporting live-rule and boot-persistence status separately.
@@ -50,6 +51,24 @@ Starting with v0.2.0, generated configuration does not contain `flush ruleset`. 
 When upgrading a v0.1.x configuration, the one-time migration removes only the legacy lowercase `prerouting` and `postrouting` chains created by `nftpf` inside `table ip nat` / `table ip6 nat`. Uppercase iptables-nft chains such as `PREROUTING` and `POSTROUTING` are preserved.
 
 Every successful apply also enables `nftables.service` for boot persistence. Use `nftpf --apply` to validate, atomically load, and persist the managed rules. Avoid manually restarting the global nftables service on a host shared with other firewall managers, because some distribution service units flush the complete live ruleset during restart.
+
+## Cross-Family Forwarding With Jool
+
+Same-family rules continue to use nftables directly. When entry and target families differ, nftpf creates a private Jool namespace and veth for that rule. IPv6-to-IPv4 uses dynamic NAT64 sessions; IPv4-to-IPv6 publishes the backend through static TCP/UDP BIB entries. Single ports, 1:1 ranges, and offset ranges work in either direction.
+
+Install matching kernel headers, DKMS, the Jool 4.x kernel module, and its userspace tools first. Debian/Ubuntu users can use menu item `19` or:
+
+```bash
+sudo nftpf --install-jool
+```
+
+Add rules normally: enter an IPv6 listen address and IPv4 target for v6-to-v4, or the reverse for v4-to-v6. Use `::` or `0.0.0.0` to choose an IPv6 or IPv4 wildcard entry; leaving the entry blank retains automatic family selection. Domain target resolution (`auto/4/6`) is independent of the entry family and is retained for DDNS refresh. Fixed targets do not require DNS64.
+
+The tool reserves per-rule private veth subnets within `198.18.0.0/15`, IPv6 link prefixes within `fd64:6e66:7471::/48`, and translation prefixes within `fd64:6e66:7470::/48`. Overlapping routes or foreign namespace/interface names cause an apply failure. Jool rule IDs must be in `1-32767`. Physical interfaces stay in the host namespace; an existing host forwarding firewall must permit the new veth paths.
+
+`nftpf-jool.service` restores translators at boot after networking, nftables, and the managed route service. `--apply-jool` restores only translators/routes; `--jool-status` reports their state; `--stop-jool` removes owned translators while leaving nftables rules in place. Delete, clear, stop, and uninstall remove owned namespaces and links without unloading shared Jool modules. Reapply reuses unchanged translators; changing backend connection parameters recreates that rule's translator and interrupts its existing sessions. nftables commits remain atomic; Jool resources are prepared before the commit and restored on failure, but expired or interrupted sessions cannot be restored.
+
+Access lists and source tracking match the original entry family. A scoped forward guard rejects direct access to private translator addresses/prefixes, so those paths cannot bypass the public entry ACL. Managed return-route tables receive routes toward the translator, and physical-line marks are cleared inside its namespace. Jool supports native UDP; carrier packet loss or filtering before the entry still needs separate diagnosis. Large IPv4-to-IPv6 ranges require one static BIB entry per port and protocol and can take longer to apply.
 
 ## DDNS Refresh
 
@@ -94,6 +113,7 @@ Run the fast checks on any Linux host:
 ```bash
 bash -n nftpf.sh
 bash nftpf.sh --self-test
+bash tests/jool-renderer.sh ./nftpf.sh
 ```
 
 The integration test requires root plus `iproute2`, `iptables`, and `nftables`. It creates an isolated network namespace, migrates a simulated v0.1.x ruleset, and verifies that foreign iptables-nft rules survive migration, reapply, failed transactions, and cleanup. It does not modify the host network namespace.
@@ -103,6 +123,18 @@ sudo bash tests/namespace-integration.sh ./nftpf.sh
 ```
 
 The same checks run automatically through GitHub Actions.
+
+Real Jool tests require a compatible loaded kernel module, root, Python 3, and network/mount namespace support:
+
+```bash
+sudo bash tests/jool-integration.sh ./nftpf.sh
+```
+
+They verify TCP/UDP in both directions, offset ranges, unchanged translator reuse, failed-commit rollback, restart recovery, and coexistence with foreign Jool/firewall resources. CI also runs this test in a QEMU guest using a Debian kernel and its matching DKMS module. To reproduce that guest test after installing a distro kernel image/headers, Jool DKMS/tools, `qemu-system-x86`, `busybox-static`, `cpio`, `xz-utils`, and Python 3:
+
+```bash
+sudo bash tests/qemu-jool-integration.sh ./nftpf.sh
+```
 
 ## Script Update
 
@@ -131,7 +163,8 @@ The uninstall flow does not remove the `nftables` package and does not disable s
 - `nftables`.
 - `iproute2`.
 - Debian/Ubuntu for automatic nftables installation. On other systemd distributions, install nftables manually first.
-- Optional: `flock` from `util-linux` for DDNS refresh locking.
+- `flock` from `util-linux` to serialize state, rules, and Jool lifecycle changes.
+- Cross-family rules: Jool 4.x userspace and a compatible kernel module built for the running kernel. Installing Jool is an explicit operation; same-family rules do not require it.
 
 ## License
 

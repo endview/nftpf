@@ -10,6 +10,7 @@
 - 新增連接埠區段轉發規則，支援 1:1 映射和偏移映射。
 - 可為每條轉發規則新增、修改或清空備註，並在規則清單中顯示。
 - 支援 IPv4、IPv6、網域/DDNS 目標。
+- IPv6→IPv4、IPv4→IPv6 跨協定族規則自動使用 Jool Stateful NAT64。
 - 修改即時規則前驗證完整 nftables 交易。
 - 原子替換 `nftpf_*` 託管表，不重新啟動全域 nftables 服務。
 - 每次成功套用規則時啟用 nftables 開機自啟，並分別顯示即時規則與開機持久化狀態。
@@ -50,6 +51,24 @@ nftpf
 從 v0.1.x 升級時，一次性遷移只刪除 `nftpf` 舊版在 `table ip nat` / `table ip6 nat` 中建立的小寫 `prerouting`、`postrouting` 鏈；iptables-nft 使用的大寫 `PREROUTING`、`POSTROUTING` 等鏈會保留。
 
 每次成功套用都會啟用 `nftables.service` 開機自啟。可以執行 `nftpf --apply` 驗證、原子載入並持久化託管規則。如果主機同時執行其它防火牆管理程式，請避免手動重新啟動全域 nftables 服務，因為部分發行版的 service 在重新啟動時會清空整個即時 ruleset。
+
+## Jool 跨協定族轉發
+
+同族規則繼續直接使用 nftables。入口與目標協定族不同時，每條規則使用獨立的 Jool 網路命名空間及 veth：IPv6→IPv4 使用動態 NAT64 會話，IPv4→IPv6 使用靜態 TCP/UDP BIB 發布後端。兩種方向均支援單連接埠、區段 1:1 和偏移映射。
+
+先安裝與執行中核心匹配的 headers、DKMS、Jool 4.x 核心模組及使用者態工具。Debian/Ubuntu 可使用選單 `19` 或：
+
+```bash
+sudo nftpf --install-jool
+```
+
+正常新增規則即可：IPv6 監聽地址配 IPv4 目標選擇 v6→v4，反過來選擇 v4→v6。`::` 表示 IPv6 通配入口，`0.0.0.0` 表示 IPv4 通配入口；留空仍為自動選擇。網域目標的 `auto/4/6` 解析類型與入口族分別保存，DDNS 刷新沿用目標族；固定目標不需要 DNS64。
+
+內部地址取自 `198.18.0.0/15`，IPv6 veth 鏈路取自 `fd64:6e66:7471::/48`，轉換前綴取自 `fd64:6e66:7470::/48`。重疊路由或同名非託管命名空間/介面會使套用失敗。Jool 規則 ID 必須在 `1-32767`。實體網卡留在宿主命名空間，現有轉發防火牆需允許新增 veth 路徑。
+
+`nftpf-jool.service` 在網路、nftables 與託管路由服務之後恢復轉換器。`--apply-jool` 只恢復轉換器與路由，`--jool-status` 顯示狀態，`--stop-jool` 停止託管轉換器但保留 nftables 規則。刪除、清空、停止和解除安裝會清理對應命名空間/介面，不卸載共享 Jool 模組。重複套用會復用未變的轉換器；修改後端連線參數會重建該規則的轉換器並中斷既有會話。nftables 交易仍是原子提交，Jool 資源在提交前準備、失敗時回滾；已中斷或過期的會話無法恢復。
+
+存取控制及來源地址觀察仍匹配原入口族。專屬 forward 規則拒絕直接存取轉換器內部地址/前綴，避免繞過公開入口存取控制。託管回程表會補充通向轉換器的路由，實體線路 mark 在 Jool 命名空間內清除。原生 UDP 的入口網路丟包仍需獨立驗證。IPv4→IPv6 大連接埠區段需要逐埠建立靜態 BIB，套用時間會增加。
 
 ## DDNS 刷新
 
@@ -98,6 +117,7 @@ Unit=nftpf-ddns.service
 ```bash
 bash -n nftpf.sh
 bash nftpf.sh --self-test
+bash tests/jool-renderer.sh ./nftpf.sh
 ```
 
 整合測試需要 root，以及 `iproute2`、`iptables`、`nftables`。測試會建立隔離網路命名空間，模擬 v0.1.x 規則遷移，並驗證外部 iptables-nft 規則在遷移、重複套用、錯誤交易和清理後仍保持不變；不會修改宿主網路命名空間。
@@ -135,7 +155,8 @@ GitHub Actions 會自動執行同一組檢查。
 - `nftables`。
 - `iproute2`。
 - Debian/Ubuntu 可自動安裝 nftables；其它 systemd 發行版請先手動安裝。
-- 選用：`util-linux` 中的 `flock`，用於 DDNS 刷新防重疊執行。
+- `util-linux` 中的 `flock`，用於序列處理狀態、規則及 Jool 生命週期修改。
+- 跨協定族規則需要 Jool 4.x 使用者態工具及與目前核心匹配的模組。Jool 安裝為明確操作，同族規則不需要安裝。
 
 ## 授權
 

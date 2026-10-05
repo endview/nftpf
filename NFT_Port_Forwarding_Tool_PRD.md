@@ -424,16 +424,13 @@ IPv6 forwarding: enabled/disabled
 
 Rules:
 
-- IPv4 listen IP can forward only to IPv4 target IP.
-- IPv6 listen IP can forward only to IPv6 target IP.
-- Blank listen IP should follow target family.
-- Domain target should resolve to A or AAAA based on selected family.
-
-If the user enters mismatched IP families, show:
-
-```text
-错误：监听 IP 与目标地址协议族不一致。
-```
+- Same-family rules use native nftables DNAT/SNAT.
+- IPv6-to-IPv4 rules use Jool Stateful NAT64; IPv4-to-IPv6 rules use static TCP/UDP BIB publication through Jool.
+- Each cross-family rule owns an isolated translator namespace and veth, with source masking and reverse routing in the host namespace.
+- Blank listen IP retains automatic family selection; explicit `0.0.0.0` and `::` select IPv4/IPv6 wildcard entries.
+- Domain target family is selected independently of the entry, persisted as an append-only rule field, and retained by DDNS refresh.
+- Prepare and validate translators before committing nftables; failed preparation or commit restores prior translator specifications. Unchanged translators are reused; changed connection parameters may interrupt sessions.
+- Restore translators at boot and remove only owned resources on delete/clear/stop/uninstall. Never unload shared Jool modules or flush foreign rules.
 
 ## 11. DDNS Design
 
@@ -468,9 +465,9 @@ auto
 
 Auto behavior:
 
-- If listen IP is IPv4, resolve A record.
-- If listen IP is IPv6, resolve AAAA record.
-- If listen IP is blank, ask user to choose IPv4 or IPv6 when both records exist.
+- Prefer the entry's family, then try the other family if no address exists.
+- Explicit `4`/`6` chooses only the target family, independently of the entry.
+- Store the selected target family and retain it on DDNS refresh.
 
 ### 11.3 Resolver Requirements
 

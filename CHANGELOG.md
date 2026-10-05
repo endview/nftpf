@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.0] - Unreleased
+
+### Added
+
+- Added automatic Jool Stateful NAT64 paths for IPv6-to-IPv4 and IPv4-to-IPv6 TCP/UDP rules, including single ports and ranges.
+- Added per-rule namespaces/veths, static BIB publication for IPv4 entries, scoped outbound SNAT, managed policy routes, boot restoration, dependency installation, status and cleanup commands.
+- Restricts private translator paths to managed DNAT sessions, retaining frontend ACL behavior; serializes state and runtime changes with `flock`.
+- Added real kernel translation tests in an isolated QEMU guest and cross-family renderer/DNS schema regression tests.
+
+### Changed
+
+- Appended an independent target-family field to `rules.db`; older records and rule notes remain compatible.
+- DDNS resolves the stored target family independently of the entry family.
+- Reuses unchanged translators, prepares changed translators before the nftables commit, and restores prior translator specifications if preparation or commit fails.
+
 ## [0.2.1] - 2026-09-20
 
 ### Added

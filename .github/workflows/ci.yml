@@ -26,9 +26,42 @@ jobs:
         run: |
           bash -n nftpf.sh
           bash -n tests/namespace-integration.sh
+          bash -n tests/jool-renderer.sh
+          bash -n tests/jool-integration.sh
+          bash -n tests/qemu-jool-integration.sh
 
       - name: Run renderer self-test
-        run: bash nftpf.sh --self-test
+        run: |
+          bash nftpf.sh --self-test
+          bash tests/jool-renderer.sh ./nftpf.sh
 
       - name: Run isolated nftables integration test
         run: sudo bash tests/namespace-integration.sh ./nftpf.sh
+
+  jool:
+    runs-on: ubuntu-latest
+    container: debian:13
+    timeout-minutes: 15
+    steps:
+      - name: Install kernel and VM test dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git bash coreutils grep sed gawk util-linux procps \
+            iproute2 nftables python3 cpio xz-utils gzip busybox-static \
+            qemu-system-x86 linux-image-amd64 linux-headers-amd64 jool-dkms jool-tools
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Test real Jool in an isolated distro-kernel VM
+        env:
+          NFTPF_TEST_LOG: qemu-jool.log
+        run: bash tests/qemu-jool-integration.sh ./nftpf.sh
+
+      - name: Upload VM test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jool-kernel-test
+          path: qemu-jool.log
