@@ -91,7 +91,7 @@ sudo nftpf --jool-profile baseline # 对照完成后可恢复基线
 
 设置会随规则重载、重启和备份恢复保留；预设与自定义速率使用同一份状态。修改设置保留转换器和既有 TCP 连接，只调整私有命名空间内 `nftpf0` 的出口队列。物理网卡、宿主队列、拥塞算法、MTU 和卸载开关沿用原设置。遇到非托管队列会拒绝覆盖；更新失败会回滚配置和已调整的托管队列。旧备份没有该设置时，恢复为关闭。`--jool-status` 核验实际队列、速率与 pacing 开关，发现与保存值不一致时返回非零；`--apply-jool` 可重新应用托管设置，不覆盖外部队列。
 
-内网和已正常工作的线路建议保持默认关闭。Akari HK/TW 两段公网测试中，每流 300 Mbps 使四路 TCP 中位数从约 430 Mbps 提升到约 1.11 Gbps，单路仍约 276 Mbps；随后在 Hytron、Akari HK 同机隔离内网中，默认 Jool 达到数 Gbps，同样的上限反而降低吞吐。300 只作为此类公网条件下的待测候选，单连接与 UDP 需求需分别验证。详见[配置推荐与四轮测试汇总](docs/jool-configuration-recommendations.zh-CN.md)、[完整内网数据](docs/benchmarks/jool-internal-2026-10-06.csv)及[公网测试与复现方法](docs/jool-performance-2026-10-06.md)。
+内网和已正常工作的线路建议保持默认关闭。HK VPS / TW VPS 两段公网测试中，每流 300 Mbps 使四路 TCP 中位数从约 430 Mbps 提升到约 1.11 Gbps，单路仍约 276 Mbps；随后在 HK VPS A、HK VPS B 同机隔离内网中，默认 Jool 达到数 Gbps，同样的上限反而降低吞吐。300 只作为此类公网条件下的待测候选，单连接与 UDP 需求需分别验证。详见[配置推荐与四轮测试汇总](docs/jool-configuration-recommendations.zh-CN.md)、[完整内网数据](docs/benchmarks/jool-internal-2026-10-06.csv)及[公网测试与复现方法](docs/jool-performance-2026-10-06.md)。
 
 ## DDNS 刷新
 

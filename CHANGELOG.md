@@ -25,7 +25,7 @@ All notable changes to this project are documented in this file.
 ### Validation
 
 - Expanded real-kernel tests cover both persistent TCP directions during WAN/baseline/WAN switching, exact-rate limits, queue drift and repair, MTU preservation, foreign queues, backup/restore and reboot reapply.
-- The recommendation is based on sequential isolated tests on Hytron and Akari HK plus two HK/TW WAN batches. Internal Gbps values describe a software path with shared CPU, not physical NIC capacity or a promised public-network speed.
+- The recommendation is based on sequential isolated tests on HK VPS A and HK VPS B plus two HK/TW WAN batches. Internal Gbps values describe a software path with shared CPU, not physical NIC capacity or a promised public-network speed.
 - The v0.3.0 tag and release assets remain unchanged.
 
 ## [0.3.0] - 2026-10-06

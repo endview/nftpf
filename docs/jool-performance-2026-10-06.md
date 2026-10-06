@@ -2,13 +2,13 @@
 
 These measurements use the nftpf v0.3.0 translation path plus the optional namespace-egress pacing implementation on this branch. They are observations of one WAN path, not a Jool performance ceiling or a general bandwidth guarantee.
 
-Subsequent isolated tests inside Hytron and Akari HK reached multiple Gbps with pacing off. The 300 Mbps cap reduced their throughput. Keep it as an opt-in candidate for problematic WAN conditions; see the [configuration recommendations and four-test summary (Chinese)](jool-configuration-recommendations.zh-CN.md), [all 102 earlier WAN cases](benchmarks/jool-wan-2026-10-05-06.csv), and [164 controlled internal cases](benchmarks/jool-internal-2026-10-06.csv). Different durations and topologies are reported separately.
+Subsequent isolated tests inside HK VPS A and HK VPS B reached multiple Gbps with pacing off. The 300 Mbps cap reduced their throughput. Keep it as an opt-in candidate for problematic WAN conditions; see the [configuration recommendations and four-test summary (Chinese)](jool-configuration-recommendations.zh-CN.md), [all 102 earlier WAN cases](benchmarks/jool-wan-2026-10-05-06.csv), and [164 controlled internal cases](benchmarks/jool-internal-2026-10-06.csv). Different durations and topologies are reported separately.
 
 ## Path and method
 
-- Relay: Akari HK, one AMD EPYC vCPU, Debian 12, kernel `6.1.0-52-cloud-amd64`.
-- Client and backend: Akari TW, one Xeon vCPU, Debian 12, kernel `6.1.0-49-cloud-amd64`.
-- TW client → HK entry/translator → TW backend. This traverses two WAN legs and shares a TW CPU; it differs from a single-leg direct test.
+- Relay: HK VPS, one AMD EPYC vCPU, Debian 12, kernel `6.1.0-52-cloud-amd64`.
+- Client and backend: TW VPS, one Xeon vCPU, Debian 12, kernel `6.1.0-49-cloud-amd64`.
+- TW VPS client → HK VPS entry/translator → TW VPS backend. This traverses two WAN legs and shares a TW CPU; it differs from a single-leg direct test.
 - Jool kernel/userspace 4.1.15, iperf3 3.12, Realm 2.9.6. Both endpoints and the relay originally use BBR and `fq`.
 - Each throughput sample measures 30 seconds after a three-second warmup. Reported rates are receiver payload rates. CPU is whole-machine utilization during measurement, not isolated Jool CPU.
 - Use the same public addresses and isolated ports, alternate defaults and candidates, and repeat promising candidates. No data tests run concurrently.
