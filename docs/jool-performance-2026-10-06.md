@@ -46,13 +46,13 @@ Default forward retransmission counts across the five IPv6-entry samples had a m
 
 ## Using and reproducing the setting
 
-The command below belongs to this development branch; the published v0.3.0 asset does not implement it.
+The commands below are available in v0.3.1 / PR #4; the v0.3.0 release asset does not implement them. Select the WAN candidate only for comparison on the actual path.
 
 ```bash
-sudo nftpf --jool-pacing 300
+sudo nftpf --jool-profile wan-300
 sudo nftpf --jool-status
 # Repeat the same client test with pacing on and off.
-sudo nftpf --jool-pacing off
+sudo nftpf --jool-profile baseline
 ```
 
 The value is Mbps per scheduler flow, in each direction, for TCP and UDP. It is not an aggregate bandwidth cap. Actual payload throughput is lower than the configured cap and also depends on headers, loss, path capacity, and the kernel's flow classification. Pick a value for your line and concurrency. The default is off.

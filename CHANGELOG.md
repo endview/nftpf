@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.1] - 2026-10-06
+
+### Added
+
+- Added optional TCP/UDP per-flow pacing on owned Jool namespace egress queues, with `--jool-pacing N`, persistence, backup/restore, and partial-update rollback.
+- Added `--jool-profile baseline|wan-300` and menu `19 → 4`. The recommended baseline is unpaced; the 300 Mbps preset is a WAN test candidate, not a universal speed improvement.
+- Added live queue/rate/pacing checks to `--jool-status`, including nonzero status when saved and applied settings differ.
+- Published configuration guidance, 164 controlled internal cases, 102 WAN cases and 32 idle-latency comparisons, keeping topology, load and accounting differences explicit.
+
+### Changed
+
+- Preserves the unpaced default, existing MTU/offloads and same-family nftables path. Existing saved pacing remains selected on upgrade.
+- Profile/rate changes reuse translator instances and preserve established TCP connections; physical NIC settings and host congestion control remain unchanged.
+- Validates custom rates against fq's 32-bit byte-rate limit: 1-34359 Mbps, or 0/off to disable.
+
+### Fixed
+
+- Explicitly re-enables pacing when reapplying an owned fq queue that was externally switched to `nopacing`.
+- Restores the previous setting and already-updated queues after partial failure or failed backup import. Legacy backups without pacing restore the unpaced baseline.
+
+### Validation
+
+- Expanded real-kernel tests cover both persistent TCP directions during WAN/baseline/WAN switching, exact-rate limits, queue drift and repair, MTU preservation, foreign queues, backup/restore and reboot reapply.
+- The recommendation is based on sequential isolated tests on Hytron and Akari HK plus two HK/TW WAN batches. Internal Gbps values describe a software path with shared CPU, not physical NIC capacity or a promised public-network speed.
+- The v0.3.0 tag and release assets remain unchanged.
+
 ## [0.3.0] - 2026-10-06
 
 ### Added

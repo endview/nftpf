@@ -4,7 +4,7 @@
 
 这里合并两轮既有公网大测试，并按用户要求先在 Hytron 隔离内网测试、清理，再在 Akari HK 隔离内网复验。公网与内网、单连接与四连接、最大负载与固定负载分别解释，不混算一个“最高速度”。
 
-发布状态：[v0.3.0](https://github.com/endview/nftpf/releases/tag/v0.3.0) 已发布，包含默认 Jool 转换路径；`--jool-pacing` 是 [PR #4](https://github.com/endview/nftpf/pull/4) 的开发功能，发布的 v0.3.0 安装脚本尚不支持该命令。测试所用 nftpf 代码来自 `c4597ab2de066deba3a709417f981a5861d99dcf`；后续汇总文档提交不改变这份转换代码。
+发布准备：配置预设、`--jool-pacing` 和实际队列核验在 [PR #4](https://github.com/endview/nftpf/pull/4) 中准备随 v0.3.1 发布；[v0.3.0](https://github.com/endview/nftpf/releases/tag/v0.3.0) 的安装脚本不支持这些开关。完整吞吐测试使用 `c4597ab2de066deba3a709417f981a5861d99dcf`。v0.3.1 的预设复用相同数值配置与转换路径，新增操作另做功能回归，不把旧测速标为新版本重新测速。
 
 ## 场景选择
 
@@ -157,18 +157,39 @@ Hytron 的 v6 Realm/500 Mbps 用例，整个采样窗口（包含预热）的后
 
 完整新用例：[内网 CSV](benchmarks/jool-internal-2026-10-06.csv)，共 164 项（每机 82），20 项短测不计入长测中位数。
 
+### 转换路径带来的空载延迟
+
+复核留存的四个阶段，共 32 组同入口家族的 nftables/Jool 对照，每种配置每组 30 次 64B echo。四阶段均记录并核验相同的初始 offload 设置；TCP 预先建立连接，计时不含连接建立、DNS 或 TLS。下面仅列主测试阶段 TCP 中位数，单位 ms。
+
+| 机器 | 方向 | 同家族 nftables | Jool 跨家族 | 观察到的路径 RTT 增量 |
+| --- | --- | ---: | ---: | ---: |
+| Akari HK | v4→v6 | 0.158 | 0.220 | +0.063 |
+| Akari HK | v6→v4 | 0.153 | 0.229 | +0.076 |
+| Hytron | v4→v6 | 0.351 | 0.576 | +0.225 |
+| Hytron | v6→v4 | 0.374 | 0.565 | +0.191 |
+
+全部 32 组的中位数差为 +0.042 至 +0.246 ms。这个差值包含 nftpf 的 namespace/veth/NAT、后端协议族变化和端点调度，**不是纯 Jool 单包耗时或固定额外延迟保证**。原始汇总：[空载延迟对照 CSV](benchmarks/jool-latency-2026-10-06.csv)。CSV 的 `source` 是留存原始证据中的相对文件名，`source_sha256` 用于核对原件，并非仓库中的文件链接。
+
+固定总计 1 Gbps 时，Jool baseline 的 TCP echo P95 为 HK 0.174–0.218 ms、Hytron 0.459–0.651 ms；没有同负载同家族对照，不能算这一负载下的转换增量。HK 约 10 Gbps 饱和用例的 TCP echo P95 中位数为 v6→v4 7.599 ms、v4→v6 4.594 ms，CPU 接近满载。限流后延迟较低的用例承载速率也较低，不能据此断言 pacing 在相同负载下降低延迟。
+
+因此通用基线保留 CPU 余量和现有 offload；只有实网证据指向队列或软中断瓶颈时再定向处理。物理出口总速率整形、fq_codel、IRQ/RSS/RPS 调整未在这些 WAN 用例中验证，不作为 v0.3.1 自动配置。[Linux 多核网络扩展](https://docs.kernel.org/networking/scaling.html)，[fq_codel 手册](https://github.com/iproute2/iproute2/blob/main/man/man8/tc-fq_codel.8)。
+
 ## nftpf 的配置与验证步骤
 
-已发布 v0.3.0 的基线直接使用默认 Jool 转换，不加限流。下面命令仅适用于包含 PR #4 的开发代码；**不要按此命令判断 v0.3.0 release 已含新开关**。
+v0.3.1 新安装默认采用 `baseline`；已有配置升级时保留原速率。`baseline`、`wan-300` 与自定义速率保存到同一份 `jool-pacing.conf`，不另存一份预设状态。下面命令适用于 v0.3.1 / PR #4 代码；v0.3.0 的基线同样不限流，但不支持这些命令。
 
 ```bash
-sudo nftpf --jool-pacing off
+sudo nftpf --jool-profile baseline
 sudo nftpf --jool-status
 # 如果默认配置在实际公网路径上异常，300 只是一个待测候选：
-sudo nftpf --jool-pacing 300
+sudo nftpf --jool-profile wan-300
 # 验证完可恢复基线：
-sudo nftpf --jool-pacing off
+sudo nftpf --jool-profile baseline
+# 自定义候选：1-34359 Mbps，0/off 关闭
+sudo nftpf --jool-pacing 500
 ```
+
+交互入口为 `19 → 4`，先列出基线，再列出会影响 TCP/UDP 的公网候选。`--jool-status` 读取实际出口队列与精确 byte rate，核对保存速率、所有权标记及 pacing 开关；不一致时返回非零。`--apply-jool` 可恢复托管配置，仍拒绝覆盖非托管队列。fq 的 maxrate 属性使用 32 位字节速率，因此正整数 Mbps 上限为 34359；关闭限速时不受此参数上限约束。[iproute2 fq 实现](https://github.com/iproute2/iproute2/blob/main/tc/q_fq.c)。
 
 1. 先验证 nftpf 规则方向、实际入口/出口、Jool 内核与 CLI 版本匹配。记录 endpoint 和物理 NIC 的 MTU、offloads、qdisc、CPU/softnet/UDP socket 错误，保持其它条件相同。
 2. 用独立客户端与后端做实际公网验收，TCP 正/反向、P1/P4，30 秒+3 秒预热；交替 off 与候选并至少重复三次。也测试实际代理客户端，透明转发的 TCP 拥塞算法由端点决定，修改转发机 BBR 不会替客户端更换算法。[Linux TCP 设置](https://docs.kernel.org/networking/ip-sysctl.html#tcp-variables)。
@@ -179,7 +200,7 @@ sudo nftpf --jool-pacing off
 
 `--jool-pacing N` 保存一个统一值，作用于所有已运行的自有 Jool 规则，当前没有每规则独立速率开关。不同后端需求不一致时不要把单线路候选统一套用。N 是 Mbps/调度流，双向 TCP/UDP 都通过 namespace `nftpf0` 出口 fq；它不是整机总带宽或每应用独立带宽保证。转发包按 hash 分类，碰撞可能共用调度流；实际 payload 还要扣除头部开销和负载影响。大并发、同时双向传输和多路复用需要用真实流数另验。[iproute2 fq 手册](https://github.com/iproute2/iproute2/blob/main/man/man8/tc-fq.8)。
 
-该开发实现默认关闭，修改时保留 namespace、Jool instance 和已有连接，保存至状态目录并随规则重载/备份恢复；旧备份回到 off。它只管理自己创建的 queue，遇到其它 queue 拒绝覆盖，失败回退，不修改物理 NIC、全局拥塞控制、MTU 或 offloads。已通过实核生命周期回归；这些性质也不意味着应把 300 设置为默认。
+实现默认关闭，修改时保留 namespace、Jool instance 和已有连接，保存至状态目录并随规则重载/备份恢复；旧备份回到 off。它只管理自己创建的 queue，遇到其它 queue 拒绝覆盖，失败回退，不修改物理 NIC、全局拥塞控制、MTU 或 offloads。预设、队列漂移修复和已有连接保留通过实核生命周期回归核验；这些性质也不意味着应把 300 设置为默认。
 
 ## 清理与适用边界
 

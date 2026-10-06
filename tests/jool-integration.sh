@@ -159,33 +159,56 @@ probe 2001:db8:1::1 4060 tcp
 
 # Optional pacing owns only the namespace egress queue and preserves translators.
 [[ "$(jool_read_pacing_rate)" == 0 ]]
-for rate in '' -1 01 100001 '300;echo bad'; do
+for rate in '' -1 01 34360 100000 '300;echo bad'; do
     if set_jool_pacing "$rate" >/dev/null 2>&1; then exit 1; fi
 done
 tc qdisc replace dev entry0 root handle 9fff: fq
 ip netns exec nftpf-jool-1 tc qdisc replace dev nftpf0 root handle 8fff: fq
-if set_jool_pacing 300 >/dev/null 2>&1; then echo 'foreign queue was overwritten' >&2; exit 1; fi
+if set_jool_profile wan-300 >/dev/null 2>&1; then echo 'foreign queue was overwritten' >&2; exit 1; fi
 ip netns exec nftpf-jool-1 tc qdisc show dev nftpf0 | grep -q 'fq 8fff:'
 [[ "$(jool_read_pacing_rate)" == 0 ]]
 ip netns exec nftpf-jool-1 tc qdisc del dev nftpf0 root
+# Presets must preserve existing private-link MTU as well as host queues.
+ip link set npj1 mtu 1400
+ip netns exec nftpf-jool-1 ip link set nftpf0 mtu 1400
+show_jool_status > "$work/status-baseline"
+grep -q '配置预设: baseline' "$work/status-baseline"
 ip netns exec client python3 - "$work" <<'PY' &
-import pathlib,socket,sys,time
+import contextlib,pathlib,socket,sys,time
 work=pathlib.Path(sys.argv[1])
-with socket.create_connection(('2001:db8:1::1',4060),timeout=5) as sock:
-    sock.sendall(b'before-pacing');assert sock.recv(128)==b'before-pacing'
+with contextlib.ExitStack() as stack:
+    sockets=[stack.enter_context(socket.create_connection(address,timeout=5))
+             for address in [('2001:db8:1::1',4060),('192.0.2.1',4061)]]
+    for sock in sockets:
+        sock.sendall(b'before-pacing');assert sock.recv(128)==b'before-pacing'
     work.joinpath('connection-ready').touch()
-    deadline=time.monotonic()+15
-    while not work.joinpath('pacing-enabled').exists():
-        assert time.monotonic()<deadline
-        time.sleep(.05)
-    sock.sendall(b'after-pacing');assert sock.recv(128)==b'after-pacing'
-print('PASS persistent TCP connection survives pacing enable')
+    for event in ['pacing-enabled','baseline-enabled','pacing-restored']:
+        deadline=time.monotonic()+30
+        while not work.joinpath(event).exists():
+            assert time.monotonic()<deadline
+            time.sleep(.05)
+        payload=event.encode()
+        for sock in sockets:
+            sock.sendall(payload);assert sock.recv(128)==payload
+        work.joinpath(event+'-checked').touch()
+print('PASS both persistent TCP directions survive WAN/baseline/WAN profiles')
 PY
 connection_pid=$!
-for attempt in {1..100}; do [[ ! -f "$work/connection-ready" ]] || break; sleep .05; done
-[[ -f "$work/connection-ready" ]]
-set_jool_pacing 300
+wait_for_file() {
+    for attempt in {1..200}; do [[ ! -f "$1" ]] || return 0; sleep .05; done
+    return 1
+}
+wait_for_file "$work/connection-ready"
+# Exercise the real CLI, not only the shell helper used in lifecycle tests.
+STATE_DIR="$STATE_DIR" bash "$script" --jool-profile wan-300
 touch "$work/pacing-enabled"
+wait_for_file "$work/pacing-enabled-checked"
+STATE_DIR="$STATE_DIR" bash "$script" --jool-profile baseline
+show_jool_status > "$work/status-baseline-restored"
+touch "$work/baseline-enabled"
+wait_for_file "$work/baseline-enabled-checked"
+set_jool_profile wan-300
+touch "$work/pacing-restored"
 wait "$connection_pid"
 [[ "$(jool_read_pacing_rate)" == 300 ]]
 [[ "$(cat "$JOOL_STATE_DIR/1.inode")" == "$inode_before" ]]
@@ -195,6 +218,29 @@ assert_pacing() {
 }
 assert_pacing 1
 assert_pacing 2
+show_jool_status > "$work/status-paced"
+grep -q '配置预设: wan-300' "$work/status-paced"
+grep -q '已核验: fq pacing 每流 300 Mbps' "$work/status-paced"
+ip -o link show dev npj1 | grep -q 'mtu 1400'
+ip netns exec nftpf-jool-1 ip -o link show dev nftpf0 | grep -q 'mtu 1400'
+ip link set npj1 mtu 1500
+ip netns exec nftpf-jool-1 ip link set nftpf0 mtu 1500
+
+# Status detects external drift; reapply repairs only our queue without replacing
+# translator namespaces. Check exact-rate boundaries against the real kernel.
+ip netns exec nftpf-jool-1 tc qdisc change dev nftpf0 root fq maxrate 400mbit
+if show_jool_status > "$work/status-wrong-rate"; then echo 'wrong rate reported ready' >&2; exit 1; fi
+grep -q '不一致' "$work/status-wrong-rate"
+ip netns exec nftpf-jool-1 tc qdisc change dev nftpf0 root fq maxrate 300mbit nopacing
+if show_jool_status > "$work/status-nopacing"; then echo 'disabled pacing reported ready' >&2; exit 1; fi
+apply_jool_runtime
+show_jool_status > "$work/status-repaired"
+[[ "$(cat "$JOOL_STATE_DIR/1.inode")" == "$inode_before" ]]
+set_jool_pacing 34359
+show_jool_status > "$work/status-maxrate"
+set_jool_pacing 1
+show_jool_status > "$work/status-minrate"
+set_jool_profile wan-300
 tc qdisc show dev entry0 | grep -q 'fq 9fff:'
 tc qdisc show dev npj1 | grep -q noqueue
 for proto in tcp udp; do
@@ -333,11 +379,16 @@ probe 192.0.2.1 4061 udp
 nft list table inet foreign_guard | grep -q foreign-guard
 ip netns exec foreign-jool jool -i foreign global display >/dev/null
 
-set_jool_pacing off
+set_jool_profile baseline
 [[ "$(jool_read_pacing_rate)" == 0 ]]
 ip netns exec nftpf-jool-1 tc qdisc show dev nftpf0 | grep -q noqueue
 [[ ! -f "$JOOL_STATE_DIR/1.pacing" ]]
 probe 2001:db8:1::1 4060 tcp
+show_jool_status > "$work/status-final-baseline"
+touch "$JOOL_STATE_DIR/1.pacing"
+if show_jool_status > "$work/status-stale-marker"; then echo 'stale pacing marker reported ready' >&2; exit 1; fi
+rm "$JOOL_STATE_DIR/1.pacing"
+show_jool_status >/dev/null
 tc qdisc show dev entry0 | grep -q 'fq 9fff:'
 
 unload_managed_rules
@@ -345,5 +396,5 @@ stop_jool_runtime
 [[ -z "$(ip netns list | awk '$1 ~ /^nftpf-jool-/ {print $1}')" ]]
 nft list table inet foreign_guard >/dev/null
 ip netns exec foreign-jool jool -i foreign global display >/dev/null
-echo '[OK] real Jool TCP/UDP, both directions, pacing, persistent TCP, backups, ranges, policy routes, ACLs, reuse, edits, rollback, restore, collision safety, and coexistence tests passed.'
+echo '[OK] real Jool TCP/UDP, both directions, profiles, queue drift/repair, rate bounds, MTU preservation, persistent TCP, backups, ranges, policy routes, ACLs, reuse, edits, rollback, restore, collision safety, and coexistence tests passed.'
 TEST

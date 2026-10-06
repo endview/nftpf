@@ -76,17 +76,20 @@ Access lists and source tracking match the original entry family. A scoped forwa
 
 Cross-family translation does not guarantee higher throughput than a TCP relay. Real WAN comparisons with Realm found lower Jool relay CPU at equal rates, but lower and variable unrestricted TCP throughput on the tested path. Benchmark your intended path before choosing a forwarding method.
 
-### Optional Per-Flow Pacing
+### Recommended Profiles And Optional Per-Flow Pacing
 
-This development feature is not included in the published v0.3.0 release. Menu `19` or these commands save an optional rate cap for each TCP/UDP flow in every managed Jool translator:
+Profiles and per-flow pacing are new in v0.3.1; the v0.3.0 release assets do not include these flags. New installations default to `baseline`: no managed rate cap, with MTU and offloads preserved. Upgrades retain an existing saved rate. Use menu `19 → 4` to select the baseline or a WAN candidate, or run:
 
 ```bash
-sudo nftpf --jool-pacing 300   # 300 Mbps per flow; applies to live translators
+sudo nftpf --jool-profile baseline # recommended: disable managed per-flow cap
 sudo nftpf --jool-status
-sudo nftpf --jool-pacing off   # restore the default, unpaced behavior
+# Select a candidate only for comparison on the actual WAN path:
+sudo nftpf --jool-profile wan-300  # all Jool rules: 300 Mbps/flow, TCP/UDP both ways
+sudo nftpf --jool-pacing 500       # custom 1-34359 Mbps; 0/off disables
+sudo nftpf --jool-profile baseline # restore the baseline after comparison
 ```
 
-The setting survives rule reapply, reboot, and backup/restore. Changing it preserves translators and existing TCP connections. Only the private namespace's `nftpf0` egress queue is configured; physical NICs, host queues, congestion control, MTU, and offloads stay as configured. Foreign queues are rejected, and a failed update restores the previous setting and managed queues. Old backups without the setting restore pacing to off.
+The setting survives rule reapply, reboot, and backup/restore; profiles and custom rates share the same state. Changing it preserves translators and existing TCP connections. Only the private namespace's `nftpf0` egress queue is configured; physical NICs, host queues, congestion control, MTU, and offloads stay as configured. Foreign queues are rejected, and a failed update restores the previous setting and managed queues. Old backups without the setting restore pacing to off. `--jool-status` checks the live queue, exact rate and pacing switch, returning nonzero when they differ from saved state. `--apply-jool` reapplies owned settings without overwriting foreign queues.
 
 Keep pacing off for internal networks and paths that already perform well. On the two-leg Akari HK/TW WAN path, a 300 Mbps flow cap increased four-stream TCP from a median 430 Mbps to about 1.11 Gbps; one stream remained about 276 Mbps. Isolated tests inside Hytron and Akari HK reached multiple Gbps unpaced, and the same cap reduced their throughput. Treat 300 as a candidate for that WAN condition and validate single-stream and UDP requirements. See the [configuration recommendations and four-test evidence (Chinese)](docs/jool-configuration-recommendations.zh-CN.md), the [complete internal dataset](docs/benchmarks/jool-internal-2026-10-06.csv), and the [WAN benchmark and reproduction guide](docs/jool-performance-2026-10-06.md).
 
