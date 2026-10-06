@@ -24,7 +24,7 @@ copy_libraries() {
         cp -L "$library" "$root$library"
     done < <(ldd "$binary" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}')
 }
-for program in bash nft ip jool modprobe sysctl stat awk grep sed head sort cut tr realpath tar mktemp chmod cp mv rm cat date unshare mount umount flock python3; do
+for program in bash nft ip tc jool modprobe sysctl stat awk grep sed head sort cut tr realpath tar mktemp chmod cp mv rm cat date unshare mount umount flock python3; do
     binary=$(command -v "$program")
     cp -L "$binary" "$root/usr/bin/$program"
     copy_libraries "$binary"
@@ -45,7 +45,7 @@ while IFS= read -r module; do
     fi
 done < <(
     {
-        for name in jool veth crc32c_generic crc32c_intel nf_tables nft_nat nft_chain_nat nft_masq nft_counter nft_ct nft_set_hash nft_set_rbtree nft_set_pipapo; do
+        for name in jool veth sch_fq crc32c_generic crc32c_intel nf_tables nft_nat nft_chain_nat nft_masq nft_counter nft_ct nft_set_hash nft_set_rbtree nft_set_pipapo; do
             modprobe --set-version "$kernel" --show-depends "$name" 2>/dev/null || true
         done
     } | awk '$1 == "insmod" {print $2}' | sort -u

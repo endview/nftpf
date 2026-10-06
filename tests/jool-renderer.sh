@@ -58,6 +58,34 @@ if jool_addresses 0 >/dev/null 2>&1 || jool_addresses 32768 >/dev/null 2>&1; the
 jool_addresses 32767
 [[ "$J_NS4" == 198.19.255.254 && "$J_VETH" == npj32767 ]]
 
+# Presets share the numeric setting, including for an installation without live
+# translators. Reject invalid CLI input before changing that saved value.
+[[ "$(jool_read_pacing_rate)" == 0 ]]
+set_jool_profile wan-300
+[[ "$(jool_read_pacing_rate)" == 300 ]]
+[[ "$(stat -c %a "$(jool_pacing_file)")" == 600 ]]
+for profile in '' auto 300 'baseline;echo bad'; do
+    if set_jool_profile "$profile" >/dev/null 2>&1; then exit 1; fi
+    [[ "$(jool_read_pacing_rate)" == 300 ]]
+done
+for rate in '' -1 01 34360 100000 '300;echo bad'; do
+    if set_jool_pacing "$rate" >/dev/null 2>&1; then exit 1; fi
+    [[ "$(jool_read_pacing_rate)" == 300 ]]
+done
+[[ "$(jool_parse_pacing_rate 34359)" == 34359 ]]
+if STATE_DIR="$STATE_DIR" bash "$script" --jool-profile >/dev/null 2>&1; then exit 1; fi
+if STATE_DIR="$STATE_DIR" bash "$script" --jool-profile baseline extra >/dev/null 2>&1; then exit 1; fi
+[[ "$(jool_read_pacing_rate)" == 300 ]]
+STATE_DIR="$STATE_DIR" bash "$script" --jool-profile baseline
+[[ "$(jool_read_pacing_rate)" == 0 ]]
+[[ "$(jool_profile_for_rate 0)" == baseline ]]
+[[ "$(jool_profile_for_rate 300)" == wan-300 ]]
+[[ "$(jool_profile_for_rate 400)" == custom ]]
+STATE_DIR="$work/fresh" bash "$script" --jool-profile baseline >/dev/null
+STATE_DIR="$work/fresh" bash "$script" --jool-status > "$work/fresh-status" 2> "$work/fresh-errors"
+grep -q 'Jool 规则: 0' "$work/fresh-status"
+[[ ! -s "$work/fresh-errors" ]]
+
 # Unit rendering and rollback do not require a real unit manager or Jool module.
 SHORTCUT_PATH="$work/installed script"
 cp "$script" "$SHORTCUT_PATH"
@@ -78,4 +106,4 @@ cmp "$JOOL_SERVICE_FILE" "$work/original.service"
 install_jool_service
 [[ ! -f "$JOOL_SERVICE_FILE" ]]
 
-echo '[OK] cross-family renderer, wildcard, DNS family, and legacy schema tests passed.'
+echo '[OK] cross-family renderer, wildcard, DNS family, legacy schema, profile CLI and rate-bound tests passed.'

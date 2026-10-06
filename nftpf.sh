@@ -5,7 +5,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-NFTPF_VERSION="${NFTPF_VERSION:-0.3.0}"
+NFTPF_VERSION="${NFTPF_VERSION:-0.3.1}"
 UPDATE_URL="${UPDATE_URL:-https://github.com/endview/nftpf/releases/latest/download/nftpf.sh}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/nftables.conf}"
 STATE_DIR="${STATE_DIR:-/etc/nft-port-forward}"
@@ -242,6 +242,10 @@ create_state_backup() {
     [ -f "$LINES_FILE" ] && cp "$LINES_FILE" "$tmp_dir/lines.db"
     [ -f "$ACCESS_FILE" ] && cp "$ACCESS_FILE" "$tmp_dir/access.conf"
     [ -f "$ACCESS_HISTORY_FILE" ] && cp "$ACCESS_HISTORY_FILE" "$tmp_dir/access-history.log"
+    if [[ -f "$(jool_pacing_file)" ]] && ! cp "$(jool_pacing_file)" "$tmp_dir/jool-pacing.conf"; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
     [ -f "$CONFIG_FILE" ] && cp "$CONFIG_FILE" "$tmp_dir/nftables.conf"
     {
         echo "created_at=$timestamp"
@@ -1377,11 +1381,124 @@ jool_validate_rules() {
 }
 
 jool_check_dependencies() {
-    local cmd
+    local cmd rate
+    rate=$(jool_read_pacing_rate) || return 1
+    if [[ "$rate" != 0 ]]; then
+        command -v tc >/dev/null || { echo '错误：Jool pacing 需要 iproute2 的 tc。' >&2; return 1; }
+    fi
     for cmd in ip jool modprobe sysctl stat; do
         command -v "$cmd" >/dev/null || { echo "错误：缺少 $cmd；运行 nftpf --install-jool 安装 Jool 依赖。" >&2; return 1; }
     done
     modprobe jool || { echo '错误：无法加载 jool；检查当前内核 headers、DKMS 和模块版本。' >&2; return 1; }
+}
+
+jool_pacing_file() { printf '%s\n' "${JOOL_PACING_FILE:-$STATE_DIR/jool-pacing.conf}"; }
+
+jool_parse_pacing_rate() {
+    local rate=${1:-}
+    [[ "$rate" != off ]] || rate=0
+    # fq's maxrate attribute is a u32 byte rate, not a 64-bit bit rate.
+    if [[ ! "$rate" =~ ^(0|[1-9][0-9]{0,4})$ ]] || ((rate > 34359)); then
+        echo '错误：Jool 每流速率需为 1-34359 Mbps，0/off 关闭。' >&2
+        return 1
+    fi
+    printf '%s\n' "$rate"
+}
+
+jool_read_pacing_rate() {
+    local file=${1:-$(jool_pacing_file)} rate=0
+    if [[ -f "$file" ]]; then rate=$(cat "$file") || return 1; fi
+    jool_parse_pacing_rate "$rate"
+}
+
+jool_profile_for_rate() {
+    case "$1" in
+        0) echo baseline ;;
+        300) echo wan-300 ;;
+        *) echo custom ;;
+    esac
+}
+
+set_jool_profile() {
+    local profile=${1:-} rate
+    case "$profile" in
+        baseline) rate=0 ;;
+        wan-300) rate=300 ;;
+        *) echo '用法：nftpf --jool-profile baseline|wan-300' >&2; return 1 ;;
+    esac
+    # Presets use the same saved rate and transaction as custom pacing. There
+    # is no second profile file that could conflict with backup/reboot state.
+    set_jool_pacing "$rate" || return 1
+    echo "Jool 配置预设: $profile"
+    if [[ "$profile" == baseline ]]; then
+        echo '推荐基线：关闭托管每流限速，沿用现有 MTU、offload 和物理网卡设置。'
+    else
+        echo '公网候选：所有托管 Jool 规则的双向 TCP/UDP 每流上限为 300 Mbps；请核验单连接与 UDP 需求。'
+    fi
+}
+
+jool_apply_pacing() {
+    local rate root marker="$JOOL_STATE_DIR/$R_ID.pacing"
+    rate=${JOOL_PACING_OVERRIDE:-$(jool_read_pacing_rate)}
+    rate=$(jool_parse_pacing_rate "$rate") || return 1
+    [[ "$rate" != 0 || -f "$marker" ]] || return 0
+    jool_namespace_owned && jool_link_owned || return 1
+    command -v tc >/dev/null || { echo '错误：Jool pacing 需要 iproute2 的 tc。' >&2; return 1; }
+    root=$(ip netns exec "$J_NAME" tc qdisc show dev nftpf0) || return 1
+    root=$(printf '%s\n' "$root" | awk '$4 == "root" { print $2 " " $3 }')
+    if [[ "$root" != 'noqueue 0:' ]] && { [[ "$root" != 'fq 7fff:' ]] || [[ ! -f "$marker" ]]; }; then
+        echo "错误：拒绝覆盖 $J_NAME/nftpf0 的非托管队列。" >&2
+        return 1
+    fi
+    if [[ "$rate" == 0 ]]; then
+        if [[ "$root" == 'fq 7fff:' ]]; then
+            ip netns exec "$J_NAME" tc qdisc del dev nftpf0 root || return 1
+        fi
+        rm -f -- "$marker"
+    else
+        # Only the namespace's egress needs pacing; a second root-veth queue
+        # doubles scheduling work. Physical interfaces remain untouched.
+        printf '%s\n' "$rate" > "$marker" || return 1
+        ip netns exec "$J_NAME" tc qdisc replace dev nftpf0 root handle 7fff: fq pacing maxrate "${rate}mbit"
+    fi
+}
+
+jool_apply_live_pacing() {
+    local file
+    for file in "$JOOL_STATE_DIR"/*.rule; do
+        [[ -f "$file" ]] || continue
+        read_rule_fields "$(cat "$file")"
+        jool_addresses "$R_ID" || return 1
+        jool_namespace_exists || continue
+        jool_apply_pacing || return 1
+    done
+}
+
+set_jool_pacing() { with_state_lock set_jool_pacing_unlocked "$@"; }
+set_jool_pacing_unlocked() {
+    local rate file temp previous present=0
+    rate=$(jool_parse_pacing_rate "${1:-}") || return 1
+    file=$(jool_pacing_file)
+    previous=$(jool_read_pacing_rate) || return 1
+    [[ ! -f "$file" ]] || present=1
+    temp=$(mktemp "$STATE_DIR/.jool-pacing.XXXXXX") || return 1
+    if ! { printf '%s\n' "$rate" > "$temp" && chmod 600 "$temp" && mv -f -- "$temp" "$file"; }; then
+        rm -f -- "$temp"
+        return 1
+    fi
+    if jool_apply_live_pacing; then
+        echo "Jool 每流 pacing: ${rate} Mbps（0 表示关闭，TCP/UDP 均适用）。"
+        return 0
+    fi
+    # Restore the old setting and all queues already changed in this attempt.
+    if [[ "$present" == 1 ]]; then
+        printf '%s\n' "$previous" > "$file" || return 1
+    else
+        rm -f -- "$file" || return 1
+    fi
+    jool_apply_live_pacing || echo '错误：部分 pacing 队列回滚失败，请检查 --jool-status。' >&2
+    echo '错误：Jool pacing 未应用，配置已回滚。' >&2
+    return 1
 }
 
 install_jool_dependencies() {
@@ -1438,7 +1555,7 @@ jool_delete_record() {
     if jool_namespace_exists; then
         ip netns del "$J_NAME" || return 1
     fi
-    rm -f -- "$JOOL_STATE_DIR/$id.rule" "$JOOL_STATE_DIR/$id.inode"
+    rm -f -- "$JOOL_STATE_DIR/$id.rule" "$JOOL_STATE_DIR/$id.inode" "$JOOL_STATE_DIR/$id.pacing"
 }
 
 jool_runtime_key() {
@@ -1476,6 +1593,7 @@ jool_ensure_record() {
         if [[ "$saved_key" == "$new_key" ]] && jool_namespace_owned && jool_link_owned &&
             ip netns exec "$J_NAME" jool -i nftpf global display >/dev/null 2>&1; then
             printf '%s\n' "$record" > "$JOOL_STATE_DIR/$R_ID.rule"
+            jool_apply_pacing || return 1
             jool_set_root_routes
             return $?
         fi
@@ -1534,6 +1652,7 @@ EOF
         ip netns exec "$J_NAME" jool -i nftpf global update drop-externally-initiated-tcp false || return 1
         ip netns exec "$J_NAME" jool -i nftpf global update address-dependent-filtering false || return 1
     fi
+    jool_apply_pacing || return 1
     jool_set_root_routes
 }
 
@@ -1543,6 +1662,7 @@ jool_snapshot_runtime() {
     for file in "$JOOL_STATE_DIR"/*.rule; do
         [[ -f "$file" ]] || continue
         cp "$file" "$JOOL_ROLLBACK_DIR/" || return 1
+        [[ ! -f "${file%.rule}.pacing" ]] || cp "${file%.rule}.pacing" "$JOOL_ROLLBACK_DIR/" || return 1
     done
     if [[ "${NFTPF_JOOL_SKIP_SYSTEMD:-0}" != "1" ]]; then
         [[ ! -f "$JOOL_SERVICE_FILE" ]] || cp "$JOOL_SERVICE_FILE" "$JOOL_ROLLBACK_DIR/service.before" || return 1
@@ -1557,6 +1677,7 @@ jool_snapshot_runtime() {
 
 jool_restore_runtime() {
     local file record id failed=0
+    local JOOL_PACING_OVERRIDE
     [[ -n "${JOOL_ROLLBACK_DIR:-}" && -d "$JOOL_ROLLBACK_DIR" ]] || return 0
     if [[ "${NFTPF_JOOL_SKIP_SYSTEMD:-0}" != "1" ]]; then
         if [[ -f "$JOOL_ROLLBACK_DIR/service.before" ]]; then
@@ -1579,6 +1700,11 @@ jool_restore_runtime() {
     for file in "$JOOL_ROLLBACK_DIR"/*.rule; do
         [[ -f "$file" ]] || continue
         record=$(cat "$file")
+        id=${file##*/}; id=${id%.rule}
+        JOOL_PACING_OVERRIDE=0
+        if [[ -f "$JOOL_ROLLBACK_DIR/$id.pacing" ]]; then
+            JOOL_PACING_OVERRIDE=$(jool_read_pacing_rate "$JOOL_ROLLBACK_DIR/$id.pacing") || { failed=1; continue; }
+        fi
         jool_ensure_record "$record" || failed=1
     done
     rm -rf -- "$JOOL_ROLLBACK_DIR"
@@ -1687,22 +1813,83 @@ apply_jool_routes() {
     done
 }
 
+jool_profile_menu() {
+    echo '1. 推荐基线 baseline：关闭每流限速，保留 MTU/offload'
+    echo '2. 公网候选 wan-300：每流 300 Mbps，需按实际线路验证'
+    echo '   300 Mbps 同时限制所有 Jool 规则的 TCP/UDP；单连接高速需求请选基线。'
+    echo '0. 返回'
+    local selection
+    read -r -p '请选择配置: ' selection
+    case "$selection" in
+        1) set_jool_profile baseline ;;
+        2) set_jool_profile wan-300 ;;
+        0) return 0 ;;
+        *) echo '错误：请输入 0、1 或 2。' >&2; return 1 ;;
+    esac
+}
+
 jool_management_menu() {
     echo '1. 安装 Jool（当前内核 headers / DKMS / 工具）'
     echo '2. 查看 Jool 状态'
+    echo '3. 自定义每流 pacing（1-34359 Mbps，0/off 关闭）'
+    echo '4. 选择推荐配置（基线 / 公网候选）'
     echo '0. 返回'
     local selection
     read -r -p '请选择: ' selection
     case "$selection" in
         1) install_jool_dependencies ;;
         2) show_jool_status ;;
+        3)
+            read -r -p '每流速率 Mbps（TCP/UDP 均适用，0/off 关闭）: ' selection
+            set_jool_pacing "$selection"
+            ;;
+        4) jool_profile_menu ;;
     esac
     pause_and_return
 }
 
+jool_show_queue_status() {
+    local rate=$1 marker="$JOOL_STATE_DIR/$R_ID.pacing" queue root json expected disabled
+    command -v tc >/dev/null || { echo '  出口队列未核验：未找到 tc。'; return 1; }
+    queue=$(ip netns exec "$J_NAME" tc qdisc show dev nftpf0) || return 1
+    root=$(printf '%s\n' "$queue" | awk '$4 == "root" { print $2 " " $3 }')
+    echo "  出口队列: $queue"
+    if [[ "$rate" == 0 ]]; then
+        if [[ -f "$marker" ]]; then
+            echo '  不一致：保存的 pacing 为 off，但托管队列或标记仍存在。'
+            return 1
+        fi
+        if [[ "$root" == 'noqueue 0:' ]]; then
+            echo '  pacing 已关闭，队列与推荐基线一致。'
+        else
+            echo '  非托管队列：沿用现有设置，与测试基线不同。'
+        fi
+        return 0
+    fi
+    if [[ ! -f "$marker" || "$(jool_read_pacing_rate "$marker")" != "$rate" || "$root" != 'fq 7fff:' ]]; then
+        echo '  不一致：托管队列或标记与保存的每流速率不同。'
+        return 1
+    fi
+    # Read the exact byte rate from tc JSON; human output rounds/changes units.
+    # Filtering root avoids matching options from unrelated child qdiscs.
+    json=$(ip netns exec "$J_NAME" tc -j qdisc show dev nftpf0 root) || return 1
+    expected='"maxrate"[[:space:]]*:[[:space:]]*'"$((rate * 125000))"'([[:space:]]*[,}])'
+    disabled='"pacing"[[:space:]]*:[[:space:]]*false'
+    if [[ ! "$json" =~ $expected || "$json" =~ $disabled ]]; then
+        echo '  不一致：实际 fq 速率或 pacing 开关与保存设置不同。'
+        return 1
+    fi
+    echo "  已核验: fq pacing 每流 $rate Mbps（TCP/UDP 双向）。"
+}
+
 show_jool_status() {
-    local record count=0 failed=0
+    local record rate count=0 failed=0
+    rate=$(jool_read_pacing_rate) || return 1
     echo "Jool: $(jool --version 2>/dev/null || echo '未安装')"
+    echo "每流 pacing: $rate Mbps（0 表示关闭）"
+    echo "配置预设: $(jool_profile_for_rate "$rate")"
+    # CLI profile selection can precede the first rule on a new installation.
+    [[ -e "$RULES_FILE" ]] || { echo 'Jool 规则: 0'; return 0; }
     while IFS= read -r record; do
         [[ -z "$record" || "$record" == \#* ]] && continue
         read_rule_fields "$record"
@@ -1710,7 +1897,8 @@ show_jool_status() {
         jool_addresses "$R_ID" || return 1
         echo "[$R_ID] $R_FAMILY → $R_TARGET_FAMILY / $J_NAME"
         if jool_namespace_owned && jool_link_owned && ip netns exec "$J_NAME" jool -i nftpf global display >/dev/null 2>&1; then
-            echo '  就绪'
+            echo '  转换器就绪'
+            jool_show_queue_status "$rate" || failed=1
         else
             echo '  未就绪：请运行 nftpf --apply-jool 或检查模块/路由。'
             failed=1
@@ -3753,7 +3941,7 @@ clear_nftables_for_uninstall() {
 cleanup_state_files_for_uninstall() {
     local delete_backups=$1
 
-    rm -f -- "$RULES_FILE" "$LINES_FILE" "$ACCESS_FILE" "$ACCESS_HISTORY_FILE"
+    rm -f -- "$RULES_FILE" "$LINES_FILE" "$ACCESS_FILE" "$ACCESS_HISTORY_FILE" "$(jool_pacing_file)"
     rmdir -- "$JOOL_STATE_DIR" 2>/dev/null || true
 
     if [[ "$delete_backups" == "1" ]]; then
@@ -4373,7 +4561,7 @@ validate_backup_archive() {
         fi
 
         case "$normalized" in
-            rules.db|lines.db|access.conf|access-history.log|nftables.conf|meta.txt) ;;
+            rules.db|lines.db|access.conf|access-history.log|jool-pacing.conf|nftables.conf|meta.txt) ;;
             *)
                 echo -e "${RED}错误：备份归档包含未知文件：$entry${PLAIN}"
                 return 1
@@ -4426,16 +4614,24 @@ restore_backup_path_unlocked() {
     if [ ! -f "$tmp_dir/lines.db" ]; then
         touch "$tmp_dir/lines.db"
     fi
+    if [ ! -f "$tmp_dir/jool-pacing.conf" ]; then
+        echo 0 > "$tmp_dir/jool-pacing.conf"
+    fi
+    if ! jool_read_pacing_rate "$tmp_dir/jool-pacing.conf" >/dev/null; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
 
     create_state_backup "before-restore" 1
     rollback_dir=$(mktemp -d) || { rm -rf "$tmp_dir"; return 1; }
-    for file in rules.db lines.db access.conf access-history.log nftables.conf; do
+    for file in rules.db lines.db access.conf access-history.log jool-pacing.conf nftables.conf; do
         had_file=0
         case "$file" in
             rules.db) source=$RULES_FILE ;;
             lines.db) source=$LINES_FILE ;;
             access.conf) source=$ACCESS_FILE ;;
             access-history.log) source=$ACCESS_HISTORY_FILE ;;
+            jool-pacing.conf) source=$(jool_pacing_file) ;;
             nftables.conf) source=$CONFIG_FILE ;;
         esac
         if [ -f "$source" ]; then
@@ -4453,6 +4649,8 @@ restore_backup_path_unlocked() {
         cp "$tmp_dir/rules.db" "$RULES_FILE" || import_copy_ok=0
         cp "$tmp_dir/lines.db" "$LINES_FILE" || import_copy_ok=0
         cp "$tmp_dir/access.conf" "$ACCESS_FILE" || import_copy_ok=0
+        cp "$tmp_dir/jool-pacing.conf" "$(jool_pacing_file)" || import_copy_ok=0
+        chmod 600 "$(jool_pacing_file)" || import_copy_ok=0
         if [ -f "$tmp_dir/access-history.log" ]; then
             cp "$tmp_dir/access-history.log" "$ACCESS_HISTORY_FILE" || import_copy_ok=0
             if [ "$import_copy_ok" -eq 1 ]; then
@@ -4468,12 +4666,13 @@ restore_backup_path_unlocked() {
         [ "$import_copy_ok" -eq 1 ] || echo -e "${RED}错误：备份状态文件写入不完整，未应用规则。${PLAIN}"
     fi
 
-    for file in rules.db lines.db access.conf access-history.log nftables.conf; do
+    for file in rules.db lines.db access.conf access-history.log jool-pacing.conf nftables.conf; do
         case "$file" in
             rules.db) target=$RULES_FILE ;;
             lines.db) target=$LINES_FILE ;;
             access.conf) target=$ACCESS_FILE ;;
             access-history.log) target=$ACCESS_HISTORY_FILE ;;
+            jool-pacing.conf) target=$(jool_pacing_file) ;;
             nftables.conf) target=$CONFIG_FILE ;;
         esac
         if [ "$(cat "$rollback_dir/$file.present")" = "1" ]; then
@@ -4483,7 +4682,7 @@ restore_backup_path_unlocked() {
         fi
     done
     rm -rf "$tmp_dir" "$rollback_dir"
-    echo -e "${YELLOW}备份导入失败，规则库、访问控制、线路和配置文件已自动回滚。${PLAIN}"
+    echo -e "${YELLOW}备份导入失败，规则库、访问控制、线路、pacing 和配置文件已自动回滚。${PLAIN}"
     return 1
 }
 
@@ -4745,7 +4944,7 @@ main_menu() {
     echo -e "16. 线路管理（多网卡/多 DIA）"
     echo -e "17. 更新脚本"
     echo -e "18. 卸载脚本"
-    echo -e "19. Jool 跨协议族转发（安装/状态）"
+    echo -e "19. Jool 跨协议族转发（安装/状态/推荐配置）"
     echo -e " 0. 退出脚本"
     echo -e "################################################"
     read -p "请输入数字: " choice
@@ -4807,6 +5006,16 @@ run_cli() {
             show_jool_status
             exit $?
             ;;
+        --jool-pacing)
+            [[ $# -eq 2 ]] || { echo '用法：nftpf --jool-pacing 0|off|Mbps' >&2; exit 1; }
+            set_jool_pacing "$2"
+            exit $?
+            ;;
+        --jool-profile)
+            [[ $# -eq 2 ]] || { echo '用法：nftpf --jool-profile baseline|wan-300' >&2; exit 1; }
+            set_jool_profile "$2"
+            exit $?
+            ;;
         --apply)
             check_dependencies || exit 1
             [ "$CONFIG_AUTO_REBUILT" -eq 1 ] && exit 0
@@ -4843,6 +5052,8 @@ run_cli() {
             echo "  nftpf --apply-jool     Restore managed cross-family translators and routes"
             echo "  nftpf --stop-jool      Stop managed translators without unloading shared modules"
             echo "  nftpf --jool-status    Show managed Jool translators"
+            echo "  nftpf --jool-profile P Apply baseline (off) or wan-300 (WAN candidate)"
+            echo "  nftpf --jool-pacing N  Persist per-flow pacing, 1-34359 Mbps (0/off disables)"
             echo "  nftpf --apply          Validate, atomically apply, and persist nftpf rules"
             echo "  nftpf --self-test      Run local syntax and renderer checks"
             echo "  nftpf --update         Download and install latest nftpf script"
@@ -4861,6 +5072,8 @@ run_cli() {
             echo "  nftpf --apply-jool     Restore managed cross-family translators and routes"
             echo "  nftpf --stop-jool      Stop managed translators without unloading shared modules"
             echo "  nftpf --jool-status    Show managed Jool translators"
+            echo "  nftpf --jool-profile P Apply baseline (off) or wan-300 (WAN candidate)"
+            echo "  nftpf --jool-pacing N  Persist per-flow pacing, 1-34359 Mbps (0/off disables)"
             echo "  nftpf --apply          Validate, atomically apply, and persist nftpf rules"
             echo "  nftpf --self-test      Run local syntax and renderer checks"
             echo "  nftpf --update         Download and install latest nftpf script"

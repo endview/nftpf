@@ -76,6 +76,23 @@ Jool 核心模組與使用者態工具應使用相同版本。如果發行版已
 
 跨協定族翻譯不保證比 TCP 中繼吞吐更高。與 Realm 的公開網路實測中，Jool 在相同速率下的轉發 CPU 更低，但測試路徑上的不限速 TCP 吞吐較低且波動明顯。選擇轉發方式前應測試實際使用線路。
 
+### 推薦配置與可選的每流 pacing
+
+v0.3.1 新增配置預設與每流 pacing；v0.3.0 發布資產不包含這些開關。新安裝預設採用 `baseline`：關閉限流，保留原有 MTU/offload；升級保留已儲存的速率。選單 `19 → 4` 可選擇推薦基線或公網候選，也可使用：
+
+```bash
+sudo nftpf --jool-profile baseline # 推薦基線：關閉託管每流限速
+sudo nftpf --jool-status
+# 僅在實際公網路徑上做對照測試時選擇候選：
+sudo nftpf --jool-profile wan-300  # 所有 Jool 規則 TCP/UDP 雙向每流 300 Mbps
+sudo nftpf --jool-pacing 500       # 自訂 1-34359 Mbps；0/off 關閉
+sudo nftpf --jool-profile baseline # 對照完成後可恢復基線
+```
+
+設定會隨規則重新套用、重啟和備份恢復保留；預設與自訂速率使用同一份狀態。修改設定保留轉換器和既有 TCP 連線，只調整私有命名空間內 `nftpf0` 的出口佇列。實體網卡、宿主佇列、擁塞演算法、MTU 和卸載開關沿用原設定。非託管佇列會拒絕覆寫；更新失敗會回滾設定和已調整的託管佇列。舊備份沒有此設定時，恢復為關閉。`--jool-status` 核驗實際佇列、速率與 pacing 開關，發現與儲存值不一致時回傳非零；`--apply-jool` 可重新套用託管設定，不覆寫外部佇列。
+
+內網與已正常工作的線路建議維持預設關閉。Akari HK/TW 兩段公網測試中，每流 300 Mbps 使四路 TCP 中位數從約 430 Mbps 提升至約 1.11 Gbps，單路仍約 276 Mbps；隨後在 Hytron、Akari HK 同機隔離內網中，預設 Jool 達到數 Gbps，同樣的上限反而降低吞吐。300 僅作為這類公網條件下的待測候選，單連線與 UDP 需求需分別驗證。詳見[配置建議與四輪測試彙整（簡體中文）](docs/jool-configuration-recommendations.zh-CN.md)、[完整內網資料](docs/benchmarks/jool-internal-2026-10-06.csv)及[公網測試與重現方法](docs/jool-performance-2026-10-06.md)。
+
 ## DDNS 刷新
 
 當目標地址是網域時，工具會保存原始網域和目前解析到的 IP。你可以在選單裡手動刷新，也可以啟用自動刷新。
